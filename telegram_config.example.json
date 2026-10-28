@@ -1,0 +1,8 @@
+{
+    "telegram_bot_token": "your_telegram_bot_token_here",
+    "telegram_chat_id": "your_telegram_chat_id_here",
+    "notify_on_trades": true,
+    "notify_on_scans": true,
+    "notify_on_circuit_breakers": true,
+    "notify_on_close": true
+}

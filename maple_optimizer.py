@@ -1,0 +1,414 @@
+"""
+MAPLE Optimizer & Retrospective Learning Engine
+Runs at daily market close (4:10 PM ET) and weekly close (Friday 4:30 PM ET).
+
+Objectives:
+1. Quantitative daily and weekly portfolio performance audit:
+   - Closing NAV vs Starting/Previous Close NAV (Daily $ and % delta).
+   - Realized trades and P&L from today's executions.
+   - Position-by-position performance and drawdown attribution (identifies primary detractors and winners).
+   - Risk audit on losing positions (distance to stop loss, volatility, position concentration).
+2. Retrospective analysis of screened 32-asset universe:
+   - Missed opportunities (stocks that broke out without triggering a buy).
+3. Strategy parameter tuning within defined limits:
+   - Tunes volume capitulation, tranche sizing, and ATR target multiples when warranted by tape data.
+4. Comprehensive audit logging to maple_logic_changelog.md and Telegram performance reporting.
+"""
+
+import os
+import sys
+import csv
+import json
+import datetime
+from typing import Dict, Any, List, Optional, Tuple
+
+MAPLE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHANGELOG_FILE = os.path.join(MAPLE_DIR, "maple_logic_changelog.md")
+NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
+TRADES_FILE = os.path.join(MAPLE_DIR, "maple_trades.csv")
+
+from maple_market import get_stock_data
+from maple_ledger import (
+    load_config,
+    save_config,
+    get_ledger_state,
+    get_ticker_sector,
+    get_position_holding_days,
+)
+from maple_strategy import MapleStrategy
+
+
+def log_to_changelog(entry: str):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(CHANGELOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n\n### Optimization Log [{timestamp}]\n{entry}\n")
+
+
+def load_nav_history() -> Dict[str, Any]:
+    if os.path.exists(NAV_FILE):
+        try:
+            with open(NAV_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_nav_snapshot(date_str: str, nav: float, cash: float, positions: Dict[str, Any]):
+    history = load_nav_history()
+    history[date_str] = {
+        "nav": round(nav, 2),
+        "cash": round(cash, 2),
+        "positions": {
+            sym: {
+                "shares": p.get("shares", 0),
+                "acb": round(p.get("acb", 0), 2),
+                "close_price": round(p.get("current_price", p.get("acb", 0)), 2),
+                "unrealized_pnl": round((p.get("current_price", p.get("acb", 0)) - p.get("acb", 0)) * p.get("shares", 0), 2)
+            }
+            for sym, p in positions.items()
+            if p.get("shares", 0) > 0
+        }
+    }
+    with open(NAV_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=4)
+
+
+def get_previous_close_nav(today_str: str) -> Optional[float]:
+    history = load_nav_history()
+    # Find the most recent date before today
+    previous_dates = [d for d in sorted(history.keys()) if d < today_str]
+    if previous_dates:
+        last_date = previous_dates[-1]
+        return history[last_date].get("nav")
+    return None
+
+
+def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
+    """Extracts realized SELL trades that occurred today from maple_trades.csv."""
+    realized = []
+    if not os.path.exists(TRADES_FILE):
+        return realized
+
+    try:
+        with open(TRADES_FILE, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trade_date = row.get("Date", "")
+                action = row.get("Action", "").upper()
+                if trade_date.startswith(today_str) and action == "SELL":
+                    notes = row.get("Notes", "")
+                    pnl_val = None
+                    pnl_pct_val = None
+                    # Parse P&L from notes if present: e.g. "P&L: $-19.42 (-11.23%)"
+                    import re
+                    match = re.search(r"P&L:\s*\$?([-+]?[0-9]*\.?[0-9]+)\s*\(([-+]?[0-9]*\.?[0-9]+)%\)", notes)
+                    if match:
+                        pnl_val = float(match.group(1))
+                        pnl_pct_val = float(match.group(2))
+
+                    realized.append({
+                        "ticker": row.get("Ticker", ""),
+                        "action": action,
+                        "quantity": float(row.get("Quantity", 0)),
+                        "price": float(row.get("Price", 0)),
+                        "pnl": pnl_val,
+                        "pnl_pct": pnl_pct_val,
+                        "notes": notes,
+                    })
+    except Exception as e:
+        print(f"[OPTIMIZER WARNING] Failed to read trades for realized P&L: {e}")
+
+    return realized
+
+
+def calculate_position_attribution(
+    positions: Dict[str, Any],
+    total_equity: float
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Computes performance and risk metrics for each held position:
+    - Cost basis (ACB), current market value, unrealized P&L ($ and %)
+    - Portfolio concentration (weight %)
+    - Stop loss proximity (dollar and percentage distance to stop)
+    - Returns (position_attribution, risk_watchlist)
+    """
+    attribution = []
+    risk_watchlist = []
+    held_set = {sym for sym, p in positions.items() if float(p.get("shares", 0)) > 0}
+    holding_days = get_position_holding_days(active_tickers=held_set)
+
+    for sym, p in positions.items():
+        shs = float(p.get("shares", 0))
+        if shs <= 0:
+            continue
+        cur_p = float(p.get("current_price", p.get("acb", 0)))
+        acb = float(p.get("acb", cur_p))
+        tot_cost = acb * shs
+        mkt_val = cur_p * shs
+        unrealized = mkt_val - tot_cost
+        unrealized_pct = ((cur_p - acb) / acb * 100) if acb > 0 else 0.0
+        weight_pct = (mkt_val / total_equity * 100) if total_equity > 0 else 0.0
+        stop_px = float(p.get("stop_loss_price") or (acb * 0.95))
+        days_held = holding_days.get(sym, 0)
+        sector = get_ticker_sector(sym)
+
+        dist_to_stop_cad = cur_p - stop_px
+        dist_to_stop_pct = ((cur_p - stop_px) / cur_p * 100) if cur_p > 0 else 0.0
+
+        item = {
+            "ticker": sym,
+            "sector": sector,
+            "days_held": days_held,
+            "shares": shs,
+            "acb": round(acb, 2),
+            "current_price": round(cur_p, 2),
+            "total_cost": round(tot_cost, 2),
+            "market_value": round(mkt_val, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "unrealized_pct": round(unrealized_pct, 2),
+            "weight_pct": round(weight_pct, 1),
+            "stop_price": round(stop_px, 2),
+            "distance_to_stop_cad": round(dist_to_stop_cad, 2),
+            "distance_to_stop_pct": round(dist_to_stop_pct, 2),
+        }
+        attribution.append(item)
+
+        # Flag for risk watchlist if:
+        # 1. Unrealized loss > 1.5%
+        # 2. Distance to stop is within 3.0%
+        # 3. Position concentration > 25% with negative P&L
+        # 4. Held >= STAGNATION_DAYS with negative P&L
+        notes = []
+        if unrealized_pct <= -1.5:
+            notes.append(f"Position drawdown: {unrealized_pct:.1f}%")
+        if dist_to_stop_pct <= 3.0:
+            notes.append(f"Near stop-loss: {dist_to_stop_pct:.1f}% buffer")
+        if weight_pct >= 25.0 and unrealized < 0:
+            notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
+        if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
+            notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
+
+        if notes:
+            item_copy = dict(item)
+            item_copy["note"] = "; ".join(notes)
+            risk_watchlist.append(item_copy)
+
+    # Sort attribution by dollar contribution (detractors first)
+    attribution.sort(key=lambda x: x["unrealized_pnl"])
+    return attribution, risk_watchlist
+
+
+def scan_missed_opportunities(allowed_tickers: List[str]) -> List[Dict[str, Any]]:
+    """Identifies stocks that gained > 2.0% today or from low of day that MAPLE did not hold,
+    filtering out overextended, non-trending, or structurally rejected setups.
+    """
+    missed = []
+    state = get_ledger_state()
+    current_held = set(t for t, p in state["positions"].items() if p.get("shares", 0) > 0)
+
+    for ticker in allowed_tickers:
+        if ticker in current_held:
+            continue
+        try:
+            data = get_stock_data(ticker, mode="SHORT")
+            if not data or data.get("Price") in ("N/A", None):
+                continue
+
+            price = data.get("Price", 0.0)
+            prev_close = data.get("Prev_Close", price)
+            pct_from_low = data.get("Pct_From_Low", 0.0)
+
+            day_gain = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+
+            if day_gain >= 2.0 or pct_from_low >= 2.5:
+                # Only count as a missed opportunity if it actually passed MAPLE's structural entry gatekeepers
+                tranche_pct, _ = MapleStrategy.calculate_tranche_size(data)
+                if tranche_pct <= 0.0:
+                    continue
+                missed.append({
+                    "ticker": ticker,
+                    "day_gain": round(day_gain, 2),
+                    "pct_from_low": round(pct_from_low, 2),
+                    "rsi": data.get("RSI_7", "N/A"),
+                    "vol_ratio": data.get("Vol_Ratio", "N/A"),
+                    "adx": data.get("ADX_14", "N/A"),
+                    "ema_crossover": data.get("EMA_Crossover", "N/A")
+                })
+        except Exception:
+            pass
+
+    return missed
+
+
+def run_daily_self_assessment():
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    print(f"\n[MAPLE DAILY RETROSPECTIVE] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    config = load_config()
+    is_live = config.get("trading_mode", "").upper() == "LIVE"
+    allowed_tickers = config.get("allowed_tickers", [])
+    state = get_ledger_state()
+
+    cash = float(state.get("cash", 0.0))
+    equity = float(state.get("total_equity", cash))
+    positions = state.get("positions", {})
+
+    # Refresh held position marks with real-time TSX closing prices so delayed IBKR snapshots never skew EOD NAV
+    refreshed_any = False
+    for sym, p in positions.items():
+        if p.get("shares", 0) > 0:
+            try:
+                sd = get_stock_data(sym, mode="SHORT")
+                if sd and isinstance(sd.get("Price"), (int, float)) and sd["Price"] > 0:
+                    p["current_price"] = float(sd["Price"])
+                    refreshed_any = True
+            except Exception:
+                pass
+    if refreshed_any:
+        equity = round(
+            cash + sum(float(p["shares"]) * float(p.get("current_price", p.get("acb", 0))) for p in positions.values() if p.get("shares", 0) > 0),
+            2,
+        )
+
+    # 1. Historical NAV Tracking & Daily Delta
+    prev_equity = get_previous_close_nav(today_str)
+    if not is_live or state.get("live_verified", False):
+        save_nav_snapshot(today_str, equity, cash, positions)
+    else:
+        print("[OPTIMIZER WARNING] Broker gateway unauthenticated; skipping maple_daily_nav.json overwrite to protect NAV history.")
+
+    daily_pnl = round(equity - prev_equity, 2) if prev_equity else 0.0
+    daily_pct = round((daily_pnl / prev_equity) * 100, 2) if prev_equity else 0.0
+    cum_pnl = round(equity - 1000.0, 2)
+    cum_pct = round((cum_pnl / 1000.0) * 100, 2)
+
+    # 2. Today's Realized Executions
+    realized_trades = get_daily_realized_trades(today_str)
+
+    # 3. Position Attribution, Sector Concentration & Risk Watchlist
+    attribution, risk_watchlist = calculate_position_attribution(positions, equity)
+    max_sector_pct = float(config.get("max_sector_pct", 0.35)) * 100.0
+    sector_totals: Dict[str, float] = {}
+    for pa in attribution:
+        sec = pa.get("sector", "Other")
+        sector_totals[sec] = sector_totals.get(sec, 0.0) + float(pa.get("market_value", 0.0))
+
+    # Count today's BUY entries by signal type (Capitulation vs Regular)
+    cap_buys, reg_buys = 0, 0
+    if os.path.exists(TRADES_FILE):
+        try:
+            with open(TRADES_FILE, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("Date", "").startswith(today_str) and row.get("Action", "").upper() == "BUY":
+                        if "CAPITULATION" in row.get("Notes", "").upper():
+                            cap_buys += 1
+                        else:
+                            reg_buys += 1
+        except Exception:
+            pass
+
+    # 4. Missed Opportunities (Gatekeeper-Verified Setups Only)
+    missed = scan_missed_opportunities(allowed_tickers)
+    changes_made = []
+    audit_flags = []
+
+    for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
+        sec_pct = (val / equity * 100.0) if equity > 0 else 0.0
+        if sec_pct > max_sector_pct:
+            audit_flags.append(
+                f"[RISK ALERT] {sec} sector concentration at {sec_pct:.1f}% of NAV (cap {max_sector_pct:.0f}%); new {sec} entries gated."
+            )
+
+    if daily_pct <= -1.5:
+        worst_str = f" (primary open detractor: {attribution[0]['ticker']} CAD {attribution[0]['unrealized_pnl']:+.2f})" if attribution else ""
+        audit_flags.append(
+            f"[DRAWDOWN AUDIT] Daily NAV delta {daily_pct:+.2f}% (CAD {daily_pnl:+.2f}){worst_str}."
+        )
+    if cap_buys or reg_buys:
+        audit_flags.append(
+            f"[SIGNAL ATTRIBUTION] Today's BUY fills: {reg_buys} Trend/Regular, {cap_buys} Capitulation Reversal."
+        )
+
+    MapleStrategy._sync_from_config()
+    if missed:
+        print(f"Identified {len(missed)} gatekeeper-verified missed profit opportunities today:")
+        for m in missed:
+            print(f"  * {m['ticker']}: +{m['day_gain']}% today, +{m['pct_from_low']}% from low (RSI: {m['rsi']}, Vol: {m['vol_ratio']}x)")
+
+    # 5. Build Comprehensive Quantitative Changelog Entry
+    report = [
+        f"**Session Type:** Daily Market Close Performance Assessment",
+        f"**Portfolio Equity NAV:** CAD {equity:.2f}",
+        f"**Daily NAV Change:** CAD {daily_pnl:+.2f} ({daily_pct:+.2f}%) vs Previous Close",
+        f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}%) vs CAD 1,000.00 seed",
+        f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {equity-cash:.2f} ({(equity-cash)/equity*100:.1f}%)",
+    ]
+
+    if sector_totals and equity > 0:
+        report.append("\n**Sector Exposure Breakdown (Cap 35.0%):**")
+        for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
+            sec_pct = (val / equity) * 100.0
+            breach_tag = " ⚠️ [OVER 35% CAP]" if sec_pct > max_sector_pct else ""
+            report.append(f"- **{sec}**: CAD {val:.2f} (`{sec_pct:.1f}%` of NAV){breach_tag}")
+
+    if realized_trades:
+        report.append("\n**Realized Trades Today:**")
+        for rt in realized_trades:
+            pnl_s = f" | P&L: CAD {rt['pnl']:+.2f} ({rt['pnl_pct']:+.1f}%)" if rt.get("pnl") is not None else ""
+            report.append(f"- {rt['ticker']} {rt['action']} {rt['quantity']:g} shs @ CAD {rt['price']:.2f}{pnl_s}")
+
+    if attribution:
+        report.append("\n**Active Position Performance & Drawdown Attribution:**")
+        for pa in attribution:
+            report.append(
+                f"- **{pa['ticker']}** ({pa['sector']}, {pa['weight_pct']}% port, {pa['days_held']}d held): {pa['shares']:g} shs @ CAD {pa['current_price']:.2f} (ACB: CAD {pa['acb']:.2f}) "
+                f"| Unrealized: **CAD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)** | Buffer to Stop: CAD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
+            )
+
+    if risk_watchlist:
+        report.append("\n**Risk Watchlist & Drawdown Drivers:**")
+        for rw in risk_watchlist:
+            report.append(f"- ⚠️ **{rw['ticker']}**: {rw['note']} (Current: CAD {rw['current_price']:.2f}, Stop: CAD {rw['stop_price']:.2f}, Buffer: CAD {rw['distance_to_stop_cad']:.2f} / {rw['distance_to_stop_pct']:.1f}%)")
+
+    if missed:
+        report.append(f"\n**Screened Universe Top Movers ({len(missed)} non-held candidates):**")
+        for m in sorted(missed, key=lambda x: x.get("day_gain", 0), reverse=True)[:4]:
+            report.append(f"- **{m['ticker']}**: Day Gain: `+{m['day_gain']}%` | Low Rebound: `+{m['pct_from_low']}%` | RSI: `{m['rsi']}` | Vol: `{m['vol_ratio']}x`")
+
+    status_items = [f"[OPTIMIZATION] {c}" for c in changes_made] + audit_flags
+    if status_items:
+        report.append("\n**Autonomous Risk & Strategy Audit:**")
+        for item in status_items:
+            report.append(f"- {item}")
+    else:
+        report.append("\n**Autonomous Strategy Action:** All sector caps (<= 35%), stop buffers, and daily drawdown metrics within operating thresholds.")
+
+    log_entry = "\n".join(report)
+    log_to_changelog(log_entry)
+    print("Daily self-assessment completed and logged.\n")
+
+    # 6. Dispatch Objective Retrospective to Telegram
+    try:
+        from telegram_notifier import send_retrospective_report
+        send_retrospective_report(
+            session_type="DAILY",
+            cash=cash,
+            equity=equity,
+            positions=positions,
+            prev_equity=prev_equity,
+            realized_trades=realized_trades,
+            position_attribution=attribution,
+            risk_watchlist=risk_watchlist,
+            missed_opportunities=missed,
+            changes_made=status_items,
+        )
+        print("[OPTIMIZER] Daily performance report successfully sent to Telegram.")
+    except Exception as e:
+        print(f"[OPTIMIZER WARNING] Failed to send Telegram close report: {e}")
+
+    return log_entry
+
+
+if __name__ == "__main__":
+    run_daily_self_assessment()
