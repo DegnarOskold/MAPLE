@@ -1,0 +1,48 @@
+# ============================================================
+# MAPLE .gitignore
+# Protects confidential credentials, account IDs, tokens,
+# financial history, and local cache/binary assets.
+# ============================================================
+
+# Confidential Configuration & Credentials
+.env
+telegram_config.json
+maple_config.json
+
+# Live & Historical Financial Records (Trades, NAV, Advice Logs)
+maple_trades.csv
+maple_daily_nav.json
+maple_advice_history.txt
+maple_trades_*.csv
+
+# Runtime Caches & Local Locks
+*_cache.json
+*.log
+.advice_last_prune
+advice.lock
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Interactive Brokers Client Portal Gateway Binaries & Local Certs
+clientportal/
+clientportal.gw.zip
+*.crt
+*.pem
+*.key
+
+# Operating System & Editor Artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Temporary Scratch Files
+scratch/
+tmp/
