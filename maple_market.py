@@ -108,6 +108,15 @@ def prefetch_histories(tickers: List[str], period: str = "6mo") -> Dict[str, pd.
     return prefetched
 
 
+def _expected_intraday_vol_fraction(minutes_passed: float) -> float:
+    """TSX pre-MOC cumulative volume curve (~4.5% open cross + ~63.5% continuous + ~32% 4pm MOC, 15m .TO delay)."""
+    # ponytail: fixed TSX auction curve; fit per-ticker intraday profile only if small-cap dispersion requires it
+    if minutes_passed <= 0.0 or minutes_passed >= 390.0:
+        return 1.0
+    eff_min = max(minutes_passed - 15.0, 10.0)
+    return 0.045 + 0.635 * (eff_min / 390.0)
+
+
 def get_stock_data(
     ticker_symbol: str,
     mode: str = "SHORT",
@@ -158,11 +167,8 @@ def get_stock_data(
             else:
                 minutes_passed = (now_et - market_open).total_seconds() / 60.0
 
-            if 0.0 < minutes_passed < 390.0:
-                adjusted_sma = vol_sma_10 * (max(minutes_passed, 15.0) / 390.0)
-                vol_ratio = (float(latest["Volume"]) / adjusted_sma) if adjusted_sma > 0 else 1.0
-            else:
-                vol_ratio = (float(latest["Volume"]) / vol_sma_10) if vol_sma_10 > 0 else 1.0
+            adjusted_sma = vol_sma_10 * _expected_intraday_vol_fraction(minutes_passed)
+            vol_ratio = (float(latest["Volume"]) / adjusted_sma) if adjusted_sma > 0 else 1.0
 
             price = float(latest["Close"])
             ema_5 = float(latest["EMA_5"]) if "EMA_5" in latest and pd.notna(latest["EMA_5"]) else 0.0

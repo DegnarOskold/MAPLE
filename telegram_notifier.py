@@ -6,6 +6,7 @@ Objective, quantitative, institutional reporting format.
 """
 
 import os
+import html
 import json
 import requests
 import datetime
@@ -314,9 +315,14 @@ def send_retrospective_report(
             unrealized_pct = pa["unrealized_pct"]
             weight = pa["weight_pct"]
             sign = "+" if unrealized >= 0 else ""
+            fee_str = (
+                f" <i>[Fill {pa['fill_price']:.2f}, Gross {pa['gross_pnl']:+.2f}, Fee -{pa['entry_fee_cad']:.2f}]</i>"
+                if pa.get("entry_fee_cad", 0) > 0
+                else ""
+            )
             lines.append(
                 f"• <code>{sym}</code> ({weight:.1f}% port): {shs:g} shs @ CAD {cur_p:.2f} (ACB: {acb:.2f}) "
-                f"| P&L: <b>{sign}CAD {unrealized:.2f} ({sign}{unrealized_pct:.2f}%)</b>"
+                f"| P&L: <b>{sign}CAD {unrealized:.2f} ({sign}{unrealized_pct:.2f}%)</b>{fee_str}"
             )
     elif positions:
         lines.append("\n<b>3. Active Positions:</b>")
@@ -357,7 +363,8 @@ def send_retrospective_report(
             gain = m.get("day_gain", 0)
             rsi = m.get("rsi", "N/A")
             vol = m.get("vol_ratio", "N/A")
-            lines.append(f"• <code>{ticker}</code>: +{gain:.1f}% (RSI: {rsi} | Vol: {vol}x)")
+            gate = f" — <i>{html.escape(str(m['gate_status']))}</i>" if m.get("gate_status") else ""
+            lines.append(f"• <code>{ticker}</code>: +{gain:.1f}% (RSI: {rsi} | Vol: {vol}x){gate}")
 
     # 6. Strategy & System Adjustments
     lines.append("\n<b>6. Strategy & System Status:</b>")

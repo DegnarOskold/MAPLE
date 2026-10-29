@@ -34,6 +34,8 @@ from maple_ledger import (
     get_ledger_state,
     get_ticker_sector,
     get_position_holding_days,
+    get_position_last_buy_info,
+    normalize_ticker,
 )
 from maple_strategy import MapleStrategy
 
@@ -137,6 +139,7 @@ def calculate_position_attribution(
     risk_watchlist = []
     held_set = {sym for sym, p in positions.items() if float(p.get("shares", 0)) > 0}
     holding_days = get_position_holding_days(active_tickers=held_set)
+    buy_info_map = get_position_last_buy_info(active_tickers=held_set)
 
     for sym, p in positions.items():
         shs = float(p.get("shares", 0))
@@ -144,6 +147,10 @@ def calculate_position_attribution(
             continue
         cur_p = float(p.get("current_price", p.get("acb", 0)))
         acb = float(p.get("acb", cur_p))
+        b_info = buy_info_map.get(normalize_ticker(sym), {})
+        fill_px = float(b_info.get("fill_acb") or acb)
+        fee_drag = round((acb - fill_px) * shs, 2) if (acb - fill_px) >= 0.05 else 0.0
+        gross_pnl = round((cur_p - fill_px) * shs, 2) if fee_drag > 0 else round((cur_p - acb) * shs, 2)
         tot_cost = acb * shs
         mkt_val = cur_p * shs
         unrealized = mkt_val - tot_cost
@@ -162,6 +169,9 @@ def calculate_position_attribution(
             "days_held": days_held,
             "shares": shs,
             "acb": round(acb, 2),
+            "fill_price": round(fill_px, 2),
+            "gross_pnl": gross_pnl,
+            "entry_fee_cad": fee_drag,
             "current_price": round(cur_p, 2),
             "total_cost": round(tot_cost, 2),
             "market_value": round(mkt_val, 2),
@@ -221,11 +231,13 @@ def scan_missed_opportunities(allowed_tickers: List[str]) -> List[Dict[str, Any]
 
             day_gain = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
 
-            if day_gain >= 2.0 or pct_from_low >= 2.5:
-                # Only count as a missed opportunity if it actually passed MAPLE's structural entry gatekeepers
-                tranche_pct, _ = MapleStrategy.calculate_tranche_size(data)
-                if tranche_pct <= 0.0:
-                    continue
+            if day_gain >= 2.0 or (day_gain > 0 and pct_from_low >= 2.5):
+                tranche_pct, gate_reason = MapleStrategy.calculate_tranche_size(data)
+                gate_status = (
+                    f"ELIGIBLE ({tranche_pct*100:.0f}%)"
+                    if tranche_pct > 0.0
+                    else gate_reason.replace("BLOCKED by ", "").split(" (requires")[0][:70]
+                )
                 missed.append({
                     "ticker": ticker,
                     "day_gain": round(day_gain, 2),
@@ -233,7 +245,9 @@ def scan_missed_opportunities(allowed_tickers: List[str]) -> List[Dict[str, Any]
                     "rsi": data.get("RSI_7", "N/A"),
                     "vol_ratio": data.get("Vol_Ratio", "N/A"),
                     "adx": data.get("ADX_14", "N/A"),
-                    "ema_crossover": data.get("EMA_Crossover", "N/A")
+                    "ema_crossover": data.get("EMA_Crossover", "N/A"),
+                    "eligible": tranche_pct > 0.0,
+                    "gate_status": gate_status,
                 })
         except Exception:
             pass
@@ -332,9 +346,9 @@ def run_daily_self_assessment():
 
     MapleStrategy._sync_from_config()
     if missed:
-        print(f"Identified {len(missed)} gatekeeper-verified missed profit opportunities today:")
+        print(f"Identified {len(missed)} non-held top basket movers today:")
         for m in missed:
-            print(f"  * {m['ticker']}: +{m['day_gain']}% today, +{m['pct_from_low']}% from low (RSI: {m['rsi']}, Vol: {m['vol_ratio']}x)")
+            print(f"  * {m['ticker']}: +{m['day_gain']}% today, +{m['pct_from_low']}% from low (RSI: {m['rsi']}, Vol: {m['vol_ratio']}x | {m.get('gate_status', '')})")
 
     # 5. Build Comprehensive Quantitative Changelog Entry
     report = [
@@ -361,9 +375,14 @@ def run_daily_self_assessment():
     if attribution:
         report.append("\n**Active Position Performance & Drawdown Attribution:**")
         for pa in attribution:
+            fee_note = (
+                f" [Fill: CAD {pa['fill_price']:.2f}, Gross: CAD {pa['gross_pnl']:+.2f}, Entry Fee: CAD -{pa['entry_fee_cad']:.2f}]"
+                if pa.get("entry_fee_cad", 0) > 0
+                else ""
+            )
             report.append(
                 f"- **{pa['ticker']}** ({pa['sector']}, {pa['weight_pct']}% port, {pa['days_held']}d held): {pa['shares']:g} shs @ CAD {pa['current_price']:.2f} (ACB: CAD {pa['acb']:.2f}) "
-                f"| Unrealized: **CAD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)** | Buffer to Stop: CAD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
+                f"| Unrealized: **CAD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)**{fee_note} | Buffer to Stop: CAD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
             )
 
     if risk_watchlist:
@@ -374,7 +393,8 @@ def run_daily_self_assessment():
     if missed:
         report.append(f"\n**Screened Universe Top Movers ({len(missed)} non-held candidates):**")
         for m in sorted(missed, key=lambda x: x.get("day_gain", 0), reverse=True)[:4]:
-            report.append(f"- **{m['ticker']}**: Day Gain: `+{m['day_gain']}%` | Low Rebound: `+{m['pct_from_low']}%` | RSI: `{m['rsi']}` | Vol: `{m['vol_ratio']}x`")
+            gate_tag = f" | Gate: `{m['gate_status']}`" if m.get("gate_status") else ""
+            report.append(f"- **{m['ticker']}**: Day Gain: `+{m['day_gain']}%` | Low Rebound: `+{m['pct_from_low']}%` | RSI: `{m['rsi']}` | Vol: `{m['vol_ratio']}x`{gate_tag}")
 
     status_items = [f"[OPTIMIZATION] {c}" for c in changes_made] + audit_flags
     if status_items:

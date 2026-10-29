@@ -276,6 +276,49 @@ def log_trade(
         writer.writerow(row)
 
 
+def _size_whole_shares(
+    ticker: str,
+    allocated_cash: float,
+    unit_price: float,
+    existing_shares: float,
+    existing_val: float,
+    total_equity: float,
+    max_pos_pct: float,
+    max_single_cap: float,
+    sector_exposure: float,
+    max_sector_pct: float,
+    avail_cash: float,
+    max_single_share_pct: float,
+) -> int:
+    """Sizes whole shares, rounding >=0.5 fractional shares up when +1 share respects all risk caps."""
+    if unit_price <= 0:
+        return 0
+    shares = int(allocated_cash / unit_price)
+    if shares >= 1 and (allocated_cash / unit_price - shares) >= 0.5:
+        cand_cost = (shares + 1) * unit_price
+        if (
+            cand_cost <= allocated_cash * 1.15
+            and existing_val + cand_cost <= total_equity * max_pos_pct
+            and cand_cost <= max_single_cap
+            and sector_exposure + cand_cost <= total_equity * max_sector_pct
+            and cand_cost <= avail_cash
+        ):
+            shares += 1
+    elif shares <= 0 and existing_shares == 0:
+        if (
+            unit_price <= total_equity * max_single_share_pct
+            and unit_price <= max_single_cap
+            and sector_exposure + unit_price <= total_equity * max_sector_pct
+            and unit_price <= avail_cash
+        ):
+            shares = 1
+            print(
+                f"[MAPLE 1-SHARE FLOOR] Sizing 1 whole share of {ticker} @ ${unit_price:.2f} "
+                f"({unit_price / total_equity * 100:.1f}% of NAV <= {max_single_share_pct * 100:.0f}% single-share cap)."
+            )
+    return shares
+
+
 def execute_buy(
     ticker: str,
     allocated_cash: float,
@@ -459,20 +502,20 @@ def execute_buy(
                 limit_price = round(current_price, 2)
 
             max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
-            shares = int(allocated_cash / limit_price)
-            if shares <= 0 and existing_shares == 0:
-                if (
-                    limit_price <= total_equity * max_single_share_pct
-                    and limit_price <= max_single_cap
-                    and sector_exposure + limit_price <= max_sector_cad
-                    and limit_price <= safe_cash
-                ):
-                    shares = 1
-                    allocated_cash = limit_price
-                    print(
-                        f"[MAPLE 1-SHARE FLOOR] Sizing 1 whole share of {ticker} @ ${limit_price:.2f} "
-                        f"({limit_price / total_equity * 100:.1f}% of NAV <= {max_single_share_pct * 100:.0f}% single-share cap)."
-                    )
+            shares = _size_whole_shares(
+                ticker,
+                allocated_cash,
+                limit_price,
+                existing_shares,
+                existing_val,
+                total_equity,
+                max_pos_pct,
+                max_single_cap,
+                sector_exposure,
+                max_sector_pct,
+                safe_cash,
+                max_single_share_pct,
+            )
             if shares <= 0:
                 print(f"[MAPLE] Price ${limit_price:.2f} exceeds allocated cash ${allocated_cash:.2f} for 1 share.")
                 return None
@@ -622,20 +665,20 @@ def execute_buy(
         return None
 
     max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
-    shares = int(allocated_cash / current_price)
-    if shares <= 0 and current_shares == 0:
-        if (
-            current_price <= total_equity * max_single_share_pct
-            and current_price <= max_single_cap
-            and sim_sector_cad + current_price <= total_equity * max_sector_pct
-            and current_price <= cash
-        ):
-            shares = 1
-            allocated_cash = current_price
-            print(
-                f"[MAPLE 1-SHARE FLOOR] Sizing 1 whole share of {ticker} @ ${current_price:.2f} "
-                f"({current_price / total_equity * 100:.1f}% of NAV <= {max_single_share_pct * 100:.0f}% single-share cap)."
-            )
+    shares = _size_whole_shares(
+        ticker,
+        allocated_cash,
+        current_price,
+        current_shares,
+        existing_val,
+        total_equity,
+        max_pos_pct,
+        max_single_cap,
+        sim_sector_cad,
+        max_sector_pct,
+        cash,
+        max_single_share_pct,
+    )
     if shares <= 0:
         return None
 
@@ -1150,9 +1193,11 @@ def get_position_last_buy_info(active_tickers: Optional[set] = None) -> Dict[str
 
                 cur_shs = running_shares.get(ticker, 0.0)
                 if action in ("BUY", "INIT"):
+                    prev_fill = last_buy.get(ticker, {}).get("fill_acb", px)
                     new_shs = cur_shs + qty
+                    fill_acb = ((cur_shs * prev_fill) + (qty * px)) / new_shs if new_shs > 0 else px
                     running_shares[ticker] = new_shs
-                    last_buy[ticker] = {"last_buy_dt": dt, "last_buy_price": px, "shares": new_shs}
+                    last_buy[ticker] = {"last_buy_dt": dt, "last_buy_price": px, "fill_acb": round(fill_acb, 4), "shares": new_shs}
                 elif action == "SELL":
                     new_shs = cur_shs - qty
                     if new_shs <= 0.00001:

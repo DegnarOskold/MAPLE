@@ -350,7 +350,29 @@ def run_checks():
             txt = f.read()
         assert "TSX-Trader" not in txt and "market_analyzer" not in txt, f"External dependency remained in {fname}!"
 
-    print("ALL 14 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 15. Oct 28 Retrospective Patches: TSX pre-MOC volume curve, whole-share round-up, max_share_price filter, unfiltered mover & fee audit
+    assert 0.25 <= maple_market._expected_intraday_vol_fraction(150.0) <= 0.28
+    assert maple_market._expected_intraday_vol_fraction(390.0) == 1.0
+    assert maple_ledger._size_whole_shares("CNQ.TO", 226.98, 76.76, 0.0, 0.0, 947.23, 0.25, 400.0, 0.0, 0.35, 887.93, 0.30) == 3
+    assert maple_ledger._size_whole_shares("CNQ.TO", 226.98, 76.76, 0.0, 0.0, 900.00, 0.25, 400.0, 0.0, 0.35, 887.93, 0.30) == 2
+
+    cap_scan_mkt = dict(scan_mkt, **{"CSU.TO": {"Price": 3348.10, "Open": 3310.0, "EMA_5": 3320.0, "EMA_9": 3290.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.35, "ADX_14": 40.4, "RSI_7": 62.0}})
+    sigs_affordable = maple_brain.evaluate_autonomous_signals(
+        cap_scan_mkt, maple_ledger.SHARIAH_COMPLIANT_BASKET, macro_state={"GC=F": False, "CL=F": True}, max_share_price=284.18
+    )
+    assert "CSU.TO" not in [s["ticker"] for s in sigs_affordable] and "SHOP.TO" in [s["ticker"] for s in sigs_affordable]
+
+    with patch.object(maple_optimizer, "get_position_holding_days", return_value={"CNQ.TO": 0}), \
+         patch.object(maple_optimizer, "get_position_last_buy_info", return_value={"CNQ.TO": {"fill_acb": 76.66, "shares": 2.0}}):
+        cnq_attr, _ = maple_optimizer.calculate_position_attribution({"CNQ.TO": {"shares": 2.0, "acb": 77.04, "current_price": 76.78}}, 947.26)
+        assert cnq_attr[0]["gross_pnl"] == 0.24 and cnq_attr[0]["entry_fee_cad"] == 0.76, f"Fee/gross split mismatch: {cnq_attr}"
+
+    with patch.object(maple_optimizer, "get_ledger_state", return_value={"positions": {}}), \
+         patch.object(maple_optimizer, "get_stock_data", return_value={"Price": 420.54, "Prev_Close": 388.35, "Pct_From_Low": 5.66, "RSI_7": 49.71, "Vol_Ratio": 1.59, "ADX_14": 32.52, "EMA_Crossover": "BEARISH (EMA5 < EMA9)"}):
+        movers = maple_optimizer.scan_missed_opportunities(["CLS.TO"])
+        assert len(movers) == 1 and movers[0]["eligible"] is False and "Trend Gatekeeper" in movers[0]["gate_status"], f"Gated top mover hidden: {movers}"
+
+    print("ALL 15 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
