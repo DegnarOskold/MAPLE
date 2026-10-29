@@ -527,3 +527,23 @@ This document tracks all autonomous logic and parameter adaptations made by MAPL
 - ⚠️ **SAP.TO**: Near stop-loss: 0.7% buffer (Current: CAD 40.36, Stop: CAD 40.09, Buffer: CAD 0.27 / 0.7%)
 
 **Autonomous Strategy Action:** All sector caps (<= 35%), stop buffers, and daily drawdown metrics within operating thresholds.
+
+
+### Optimization Log [2026-10-28 16:10:37]
+**Session Type:** Daily Market Close Performance Assessment
+**Portfolio Equity NAV:** CAD 947.26
+**Daily NAV Change:** CAD -1.03 (-0.11%) vs Previous Close
+**Cumulative Return:** CAD -52.74 (-5.27%) vs CAD 1,000.00 seed
+**Capital Breakdown:** Cash: CAD 793.70 (83.8%) | Equity: CAD 153.56 (16.2%)
+
+**Sector Exposure Breakdown (Cap 35.0%):**
+- **Energy & Uranium**: CAD 153.56 (`16.2%` of NAV)
+
+**Realized Trades Today:**
+- SAP.TO SELL 1 shs @ CAD 40.06 | P&L: CAD -0.23 (-0.6%)
+
+**Active Position Performance & Drawdown Attribution:**
+- **CNQ.TO** (Energy & Uranium, 16.2% port, 0d held): 2 shs @ CAD 76.78 (ACB: CAD 77.04) | Unrealized: **CAD -0.52 (-0.34%)** | Buffer to Stop: CAD 4.00 (5.2%)
+
+**Autonomous Risk & Strategy Audit:**
+- [SIGNAL ATTRIBUTION] Today's BUY fills: 1 Trend/Regular, 0 Capitulation Reversal.

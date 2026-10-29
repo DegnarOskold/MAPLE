@@ -225,10 +225,13 @@ def evaluate_autonomous_signals(
     market_data: Dict[str, Dict[str, Any]],
     allowed_tickers: set,
     macro_state: Optional[Dict[str, bool]] = None,
+    max_share_price: Optional[float] = None,
+    held_tickers: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Directly scans all 32 Shariah-compliant TSX tickers for Trend Momentum and Capitulation Reversal setups."""
     MapleStrategy._sync_from_config()
     candidates = []
+    held_norm = {normalize_ticker(t) for t in held_tickers} if held_tickers else set()
 
     for raw_t in sorted(allowed_tickers):
         ticker = normalize_ticker(raw_t)
@@ -236,6 +239,8 @@ def evaluate_autonomous_signals(
             continue
         sd = market_data.get(ticker)
         if not sd or not isinstance(sd.get("Price"), (int, float)) or sd["Price"] <= 0:
+            continue
+        if max_share_price and max_share_price > 0 and ticker not in held_norm and sd["Price"] > max_share_price:
             continue
 
         rsi = sd.get("RSI_7")
@@ -409,7 +414,15 @@ def run_intraday_scan(bot_advice: str = ""):
         print(f"Extracted {len(signals)} explicit signal(s) from CLI input.")
     else:
         macro_state = get_macro_alignment()
-        signals = evaluate_autonomous_signals(market_data, allowed_tickers, macro_state=macro_state)
+        nav_est = float(ledger_state.get("total_equity") or ledger_state.get("cash", 0.0))
+        max_share_px = min(
+            float(config.get("max_single_order_cad", 400.0)),
+            nav_est * max(float(config.get("max_position_pct", 0.25)), float(config.get("max_single_share_nav_pct", 0.30))),
+        )
+        held_set = {normalize_ticker(t) for t, p in ledger_state.get("positions", {}).items() if p.get("shares", 0) > 0}
+        signals = evaluate_autonomous_signals(
+            market_data, allowed_tickers, macro_state=macro_state, max_share_price=max_share_px, held_tickers=held_set
+        )
         print(
             f"Evaluated {len(market_data)}/{len(allowed_tickers)} Shariah-compliant TSX tickers -> "
             f"{len(signals)} actionable signal(s) (Macro: GC=F={'UP' if macro_state.get('GC=F', True) else 'DOWN'}, "
@@ -463,7 +476,9 @@ def run_intraday_scan(bot_advice: str = ""):
 
                 curr_cash = get_ledger_state()["cash"]
                 allocated = round(curr_cash * tranche_pct, 2)
-                estimated_shares = max(1, int(allocated // current_price))
+                raw_shs = allocated / current_price
+                estimated_shares = int(raw_shs) + (1 if int(raw_shs) >= 1 and (raw_shs - int(raw_shs)) >= 0.5 and (int(raw_shs) + 1) * current_price <= allocated * 1.15 else 0)
+                estimated_shares = max(1, estimated_shares)
 
                 target, stop = MapleStrategy.calculate_targets(
                     current_price, stock_info, shares=estimated_shares, cost_basis=current_price
