@@ -474,14 +474,24 @@ def run_intraday_scan(bot_advice: str = ""):
                     print(f"[MAPLE SIZING BLOCKED] {ticker}: {rationale}")
                     continue
 
-                curr_cash = get_ledger_state()["cash"]
+                curr_state = get_ledger_state()
+                curr_cash = curr_state["cash"]
+                existing_pos = curr_state.get("positions", {}).get(ticker, {})
+                existing_shs = float(existing_pos.get("shares", 0.0))
+                existing_acb = float(existing_pos.get("acb", current_price))
                 allocated = round(curr_cash * tranche_pct, 2)
                 raw_shs = allocated / current_price
                 estimated_shares = int(raw_shs) + (1 if int(raw_shs) >= 1 and (raw_shs - int(raw_shs)) >= 0.5 and (int(raw_shs) + 1) * current_price <= allocated * 1.15 else 0)
                 estimated_shares = max(1, estimated_shares)
+                tot_est_shares = existing_shs + estimated_shares
+                est_basis = (
+                    ((existing_shs * existing_acb) + (estimated_shares * current_price)) / tot_est_shares
+                    if existing_shs > 0
+                    else current_price
+                )
 
                 target, stop = MapleStrategy.calculate_targets(
-                    current_price, stock_info, shares=estimated_shares, cost_basis=current_price
+                    current_price, stock_info, shares=tot_est_shares, cost_basis=est_basis
                 )
 
                 print(

@@ -348,7 +348,7 @@ def execute_buy(
         print(f"[MAPLE] Pending order already active for {ticker}. Skipping duplicate BUY.")
         return None
 
-    def _passes_scale_in_guards(active_tickers: Optional[set] = None) -> bool:
+    def _passes_scale_in_guards(active_tickers: Optional[set] = None, fallback_px: float = 0.0) -> bool:
         buy_counts = get_position_buy_counts(active_tickers=active_tickers) if active_tickers is not None else get_position_buy_counts()
         eff_count = buy_counts.get(ticker, 0)
         if active_tickers is not None and ticker in active_tickers and eff_count == 0:
@@ -372,6 +372,16 @@ def execute_buy(
                     f"[MAPLE SCALE GUARD] Blocking scale-in #2 for {ticker} on red/flat candle (Price ${current_price:.2f} <= Open ${open_price:.2f})."
                 )
                 return False
+            last_px = float((last_buy or {}).get("last_buy_price") or fallback_px or 0.0)
+            if last_px > 0:
+                min_gain_pct = 1.0 if "LOW-VOLUME" in notes.upper() else 0.5
+                req_px = round(last_px * (1.0 + min_gain_pct / 100.0), 2)
+                if current_price < req_px:
+                    print(
+                        f"[MAPLE SCALE GUARD] Blocking scale-in #2 for {ticker}: Price ${current_price:.2f} < ${req_px:.2f} "
+                        f"(+{min_gain_pct:.1f}% min progress over Entry #1 ${last_px:.2f})."
+                    )
+                    return False
         return True
 
     # In SIMULATED mode, maple_trades.csv is the ledger of record; in LIVE mode, reconcile against IBKR positions first
@@ -419,13 +429,12 @@ def execute_buy(
                 for p in positions_raw
                 if float(p.get("openQuantity", 0.0)) > 0
             }
-            if not _passes_scale_in_guards(active_tickers=live_held):
-                return None
-
             aliases = set(ticker_aliases(ticker))
             existing_pos = next((p for p in positions_raw if normalize_ticker(p.get("symbol", "")) in aliases or p.get("symbol", "").upper() in aliases), None)
             existing_shares = float(existing_pos.get("openQuantity", 0.0)) if existing_pos else 0.0
             existing_acb = float(existing_pos.get("averageEntryPrice", current_price)) if existing_pos else 0.0
+            if not _passes_scale_in_guards(active_tickers=live_held, fallback_px=existing_acb):
+                return None
             existing_val = existing_shares * current_price
             max_pos_cad = total_equity * max_pos_pct
             if existing_val + allocated_cash > max_pos_cad:

@@ -242,6 +242,8 @@ def send_retrospective_report(
     missed_opportunities: Optional[List[Dict[str, Any]]] = None,
     changes_made: Optional[List[str]] = None,
     notes: str = "",
+    buy_trades: Optional[List[Dict[str, Any]]] = None,
+    basket_pct: Optional[float] = None,
 ) -> bool:
     """
     Sends an institutional, quantitative daily performance report.
@@ -266,6 +268,7 @@ def send_retrospective_report(
     cum_sign = "+" if cum_pnl >= 0 else ""
 
     # Daily Return vs previous close (if available)
+    daily_pct = 0.0
     if prev_equity and prev_equity > 0:
         daily_pnl = equity - prev_equity
         daily_pct = (daily_pnl / prev_equity) * 100
@@ -281,14 +284,25 @@ def send_retrospective_report(
         "\n<b>1. Portfolio NAV & Capital Summary:</b>",
         f"• <b>Closing Equity NAV:</b> <b>CAD {equity:.2f}</b>",
         daily_nav_str,
+    ]
+    if basket_pct is not None and prev_equity and prev_equity > 0:
+        lines.append(
+            f"• <b>32-Ticker Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
+        )
+    lines.extend([
         f"• <b>Cumulative P&L (Inception):</b> {cum_sign}CAD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%)",
         f"• <b>Capital Allocation:</b> Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {market_val:.2f} ({market_val/equity*100:.1f}%)",
-    ]
+    ])
 
-    # 2. Realized Trades
-    if realized_trades:
-        lines.append("\n<b>2. Today's Realized Executions:</b>")
-        for rt in realized_trades:
+    # 2. Today's Executions (BUYs & Realized SELLs)
+    if buy_trades or realized_trades:
+        lines.append("\n<b>2. Today's Executions:</b>")
+        for bt in (buy_trades or []):
+            lines.append(
+                f"• <code>{bt.get('ticker', 'N/A')}</code> BUY {bt.get('quantity', 0):g} shs @ CAD {bt.get('price', 0.0):.2f} "
+                f"<i>[{html.escape(str(bt.get('bucket', 'Regular Trend')))}]</i>"
+            )
+        for rt in (realized_trades or []):
             sym = rt.get("ticker", "N/A")
             act = rt.get("action", "SELL")
             qty = rt.get("quantity", 0)
@@ -301,7 +315,7 @@ def send_retrospective_report(
                 pnl_str = f" | Realized P&L: {p_sign}CAD {pnl_val:.2f} ({p_sign}{pnl_pct_val:.1f}%)"
             lines.append(f"• <code>{sym}</code> {act} {qty:g} shs @ CAD {px:.2f}{pnl_str}")
     else:
-        lines.append("\n<b>2. Today's Realized Executions:</b> None (No positions liquidated)")
+        lines.append("\n<b>2. Today's Executions:</b> None (No trades executed)")
 
     # 3. Position-by-Position Performance & Drawdown Attribution
     if position_attribution:
