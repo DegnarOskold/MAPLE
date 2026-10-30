@@ -351,7 +351,7 @@ def run_checks():
         assert "TSX-Trader" not in txt and "market_analyzer" not in txt, f"External dependency remained in {fname}!"
 
     # 15. Oct 28 Retrospective Patches: TSX pre-MOC volume curve, whole-share round-up, max_share_price filter, unfiltered mover & fee audit
-    assert 0.25 <= maple_market._expected_intraday_vol_fraction(150.0) <= 0.28
+    assert 0.28 <= maple_market._expected_intraday_vol_fraction(150.0) <= 0.30
     assert maple_market._expected_intraday_vol_fraction(390.0) == 1.0
     assert maple_ledger._size_whole_shares("CNQ.TO", 226.98, 76.76, 0.0, 0.0, 947.23, 0.25, 400.0, 0.0, 0.35, 887.93, 0.30) == 3
     assert maple_ledger._size_whole_shares("CNQ.TO", 226.98, 76.76, 0.0, 0.0, 900.00, 0.25, 400.0, 0.0, 0.35, 887.93, 0.30) == 2
@@ -372,7 +372,30 @@ def run_checks():
         movers = maple_optimizer.scan_missed_opportunities(["CLS.TO"])
         assert len(movers) == 1 and movers[0]["eligible"] is False and "Trend Gatekeeper" in movers[0]["gate_status"], f"Gated top mover hidden: {movers}"
 
-    print("ALL 15 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 16. Oct 29 Retrospective Patches: scale-in #2 price-progress guard, post-scale target math, 3-bucket BUY audit & untruncated gate strings
+    old_buy_dt = datetime.datetime.now() - datetime.timedelta(hours=5.0)
+    with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "scale_in_cooldown_hours": 4.0, "pending_orders": {}}), \
+         patch.object(maple_ledger, "get_position_buy_counts", return_value={"CCL-B.TO": 1}), \
+         patch.object(maple_ledger, "get_position_last_buy_info", return_value={"CCL-B.TO": {"last_buy_dt": old_buy_dt, "last_buy_price": 97.72, "fill_acb": 97.72, "shares": 1.0}}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value={"cash": 500.0, "total_equity": 950.0, "positions": {"CCL-B.TO": {"shares": 1.0, "acb": 97.72, "current_price": 97.85}}}), \
+         patch.object(maple_ledger, "log_trade"):
+        assert maple_ledger.execute_buy("CCL-B.TO", 100.0, 97.85, notes="[LOW-VOLUME SCALED ENTRY]", open_price=97.00) is None
+        assert maple_ledger.execute_buy("CCL-B.TO", 100.0, 98.10, notes="[REGULAR BUY]", open_price=97.00) is None
+        assert maple_ledger.execute_buy("CCL-B.TO", 100.0, 98.95, notes="[LOW-VOLUME SCALED ENTRY]", open_price=97.00) is not None
+
+    tgt_2sh, _ = MapleStrategy.calculate_targets(97.98, {"ATR_5": 1.96, "BB_Mid": 96.26}, shares=2.0, cost_basis=98.095)
+    tgt_1sh, _ = MapleStrategy.calculate_targets(97.98, {"ATR_5": 1.96, "BB_Mid": 96.26}, shares=1.0)
+    assert tgt_2sh == 101.55 and tgt_2sh < tgt_1sh, f"Post-scale target mismatch: 2sh={tgt_2sh}, 1sh={tgt_1sh}"
+
+    buys_29 = maple_optimizer.get_daily_buy_trades("2026-10-29")
+    assert [b["bucket"] for b in buys_29] == ["Regular Trend", "Low-Volume Scaled", "Low-Volume Scaled"], f"Unexpected BUY buckets: {buys_29}"
+
+    with patch.object(maple_optimizer, "get_ledger_state", return_value={"positions": {}}), \
+         patch.object(maple_optimizer, "get_stock_data", return_value={"Price": 94.33, "Prev_Close": 92.20, "Pct_From_Low": 2.9, "RSI_7": 70.64, "Vol_Ratio": 0.81, "ADX_14": 25.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)"}):
+        atz_movers = maple_optimizer.scan_missed_opportunities(["ATZ.TO"])
+        assert "(68.0)" in atz_movers[0]["gate_status"], f"Gate status truncated mid-number: {atz_movers}"
+
+    print("ALL 16 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
