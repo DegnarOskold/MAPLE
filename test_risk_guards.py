@@ -375,6 +375,7 @@ def run_checks():
     # 16. Oct 29 Retrospective Patches: scale-in #2 price-progress guard, post-scale target math, 3-bucket BUY audit & untruncated gate strings
     old_buy_dt = datetime.datetime.now() - datetime.timedelta(hours=5.0)
     with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "scale_in_cooldown_hours": 4.0, "pending_orders": {}}), \
+         patch.object(maple_ledger, "save_config"), \
          patch.object(maple_ledger, "get_position_buy_counts", return_value={"CCL-B.TO": 1}), \
          patch.object(maple_ledger, "get_position_last_buy_info", return_value={"CCL-B.TO": {"last_buy_dt": old_buy_dt, "last_buy_price": 97.72, "fill_acb": 97.72, "shares": 1.0}}), \
          patch.object(maple_ledger, "get_ledger_state", return_value={"cash": 500.0, "total_equity": 950.0, "positions": {"CCL-B.TO": {"shares": 1.0, "acb": 97.72, "current_price": 97.85}}}), \
