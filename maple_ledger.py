@@ -91,8 +91,180 @@ def save_config(config: Dict[str, Any]):
         json.dump(config, f, indent=4)
 
 
+def get_net_contributions(
+    config: Optional[Dict[str, Any]] = None,
+    after_date: Optional[str] = None,
+    up_to_date: Optional[str] = None,
+) -> float:
+    """Returns net external cash inflows/outflows recorded in config['capital_contributions'] over (after_date, up_to_date]."""
+    cfg = config if config is not None else load_config()
+    contribs = cfg.get("capital_contributions") or {}
+    if not isinstance(contribs, dict):
+        return 0.0
+    total = 0.0
+    for d_str, amt in contribs.items():
+        d_key = str(d_str)[:10]
+        if after_date and d_key <= after_date[:10]:
+            continue
+        if up_to_date and d_key > up_to_date[:10]:
+            continue
+        try:
+            total += float(amt)
+        except (TypeError, ValueError):
+            pass
+    return round(total, 2)
+
+
+def get_total_invested_capital(
+    config: Optional[Dict[str, Any]] = None,
+    up_to_date: Optional[str] = None,
+) -> float:
+    """Returns initial_cash plus cumulative net external capital contributions."""
+    cfg = config if config is not None else load_config()
+    return round(float(cfg.get("initial_cash", 1000.0)) + get_net_contributions(cfg, up_to_date=up_to_date), 2)
+
+
+def compute_twr_pct(
+    current_equity: float,
+    config: Optional[Dict[str, Any]] = None,
+    today_str: Optional[str] = None,
+    nav_history: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Computes cash-flow-adjusted Time-Weighted Return (%) chained across maple_daily_nav.json snapshots."""
+    cfg = config if config is not None else load_config()
+    seed = float(cfg.get("initial_cash", 1000.0))
+    hist = nav_history
+    if hist is None:
+        hist = {}
+        if os.path.exists(NAV_FILE):
+            try:
+                with open(NAV_FILE, "r", encoding="utf-8") as f:
+                    hist = json.load(f)
+            except Exception:
+                hist = {}
+    t_str = (today_str or datetime.datetime.now().strftime("%Y-%m-%d"))[:10]
+    dates = [d for d in sorted(hist.keys()) if d < t_str]
+    if not dates:
+        inv = get_total_invested_capital(cfg, up_to_date=t_str)
+        return round(((current_equity - inv) / inv) * 100.0, 2) if inv > 0 else 0.0
+
+    growth = 1.0
+    first_d = dates[0]
+    first_nav = float(hist[first_d].get("nav") or seed)
+    init_base = seed + get_net_contributions(cfg, up_to_date=first_d)
+    if init_base > 0 and first_nav > 0:
+        growth *= first_nav / init_base
+
+    for i in range(1, len(dates)):
+        d0, d1 = dates[i - 1], dates[i]
+        n0 = float(hist[d0].get("nav") or 0.0)
+        n1 = float(hist[d1].get("nav") or 0.0)
+        denom = n0 + get_net_contributions(cfg, after_date=d0, up_to_date=d1)
+        if denom > 0 and n1 > 0:
+            growth *= n1 / denom
+
+    last_d = dates[-1]
+    last_nav = float(hist[last_d].get("nav") or 0.0)
+    final_denom = last_nav + get_net_contributions(cfg, after_date=last_d, up_to_date=t_str)
+    if final_denom > 0 and current_equity > 0:
+        growth *= current_equity / final_denom
+
+    return round((growth - 1.0) * 100.0, 2)
+
+
+def get_effective_order_cap(config: Dict[str, Any], total_equity: float) -> float:
+    """Scales max_single_order_cad dynamically with portfolio NAV (at least config floor or max_position_pct of NAV)."""
+    base_cap = float(config.get("max_single_order_cad", 400.0))
+    max_pos_pct = float(config.get("max_position_pct", 0.25))
+    return round(max(base_cap, total_equity * max_pos_pct), 2)
+
+
+def get_effective_daily_loss_limit(config: Dict[str, Any], ref_nav: float) -> float:
+    """Scales daily drawdown circuit breaker to max(daily_loss_limit_cad, daily_loss_limit_pct * ref_nav)."""
+    base_lim = float(config.get("daily_loss_limit_cad", 40.0))
+    lim_pct = float(config.get("daily_loss_limit_pct", 0.04))
+    return round(max(base_lim, ref_nav * lim_pct), 2)
+
+
+def reconcile_capital_flows(
+    live_cash: float,
+    live_equity: Optional[float] = None,
+    config: Optional[Dict[str, Any]] = None,
+    today_str: Optional[str] = None,
+) -> float:
+    """Auto-detects settled external broker deposits/withdrawals (>= CAD $250 in BOTH cash and equity)."""
+    cfg = config if config is not None else load_config()
+    if cfg.get("pending_orders"):
+        return 0.0
+    if not os.path.exists(NAV_FILE):
+        return 0.0
+    t_str = (today_str or datetime.datetime.now().strftime("%Y-%m-%d"))[:10]
+    try:
+        with open(NAV_FILE, "r", encoding="utf-8") as f:
+            history = json.load(f)
+    except Exception:
+        return 0.0
+
+    prev_dates = [d for d in sorted(history.keys()) if d < t_str]
+    if not prev_dates:
+        return 0.0
+    last_date = prev_dates[-1]
+    prev_cash = float(history[last_date].get("cash", 0.0))
+    prev_nav = float(history[last_date].get("nav", 0.0))
+
+    comm_est = float(cfg.get("commission_per_order_cad", 1.0))
+    net_trade_cash = 0.0
+    last_csv_cash_today: Optional[float] = None
+    if os.path.exists(TRADES_FILE):
+        try:
+            with open(TRADES_FILE, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    d_row = row.get("Date", "")[:10]
+                    if last_date < d_row <= t_str:
+                        act = row.get("Action", "").strip().upper()
+                        qty = float(row.get("Quantity", 0.0))
+                        px = float(row.get("Price", 0.0))
+                        if act == "BUY":
+                            net_trade_cash -= (qty * px + comm_est)
+                        elif act == "SELL":
+                            net_trade_cash += (qty * px - comm_est)
+                        cb = row.get("Cash_Balance")
+                        if cb not in (None, ""):
+                            last_csv_cash_today = float(cb)
+        except Exception:
+            return 0.0
+
+    contribs = cfg.setdefault("capital_contributions", {})
+    prior_recorded = get_net_contributions(cfg, after_date=last_date, up_to_date=t_str)
+    already_today = float(contribs.get(t_str, 0.0))
+    rough_unrecorded = live_cash - (prev_cash + net_trade_cash + prior_recorded)
+    if abs(rough_unrecorded) < 250.0:
+        return 0.0
+
+    # External deposits/withdrawals move BOTH cash and total_equity in the same direction (unlike stock sales or price swings)
+    if live_equity is not None and prev_nav > 0:
+        eq_unrecorded = float(live_equity) - (prev_nav + prior_recorded)
+        if abs(eq_unrecorded) < 250.0 or (eq_unrecorded * rough_unrecorded) <= 0:
+            return 0.0
+
+    if already_today == 0.0 and last_csv_cash_today is not None:
+        exact_delta = round(live_cash - last_csv_cash_today, 2)
+    elif net_trade_cash == 0.0 and prior_recorded == 0.0:
+        exact_delta = round(live_cash - prev_cash, 2)
+    else:
+        exact_delta = round(rough_unrecorded, 2)
+
+    if abs(exact_delta) < 250.0:
+        return 0.0
+
+    contribs[t_str] = round(already_today + exact_delta, 2)
+    save_config(cfg)
+    print(f"[MAPLE CAPITAL FLOW] Auto-detected settled external cash flow on {t_str}: CAD {exact_delta:+.2f} (Total {t_str}: CAD {contribs[t_str]:+.2f})")
+    return exact_delta
+
+
 def _get_reference_nav(config: Dict[str, Any]) -> float:
-    """Returns previous day's closing NAV from maple_daily_nav.json, falling back to initial_cash."""
+    """Returns previous day's closing NAV adjusted for any settled capital contributions since that close."""
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     if os.path.exists(NAV_FILE):
         try:
@@ -100,12 +272,13 @@ def _get_reference_nav(config: Dict[str, Any]) -> float:
                 history = json.load(f)
             prev_dates = [d for d in sorted(history.keys()) if d < today_str]
             if prev_dates:
-                nav = float(history[prev_dates[-1]].get("nav", 0.0))
+                last_date = prev_dates[-1]
+                nav = float(history[last_date].get("nav", 0.0))
                 if nav > 0:
-                    return nav
+                    return round(nav + get_net_contributions(config, after_date=last_date, up_to_date=today_str), 2)
         except Exception:
             pass
-    return float(config.get("initial_cash", 1000.0))
+    return get_total_invested_capital(config, up_to_date=today_str)
 
 
 def get_ledger_state() -> Dict[str, Any]:
@@ -151,10 +324,17 @@ def get_ledger_state() -> Dict[str, Any]:
                         "stop_loss_price": stp if stp else round(acb * 0.95, 2)
                     }
 
+            cash_live = round(float(balances.get("cash", 0.0)), 2)
+            eq_live = round(float(balances.get("total_equity", 0.0)), 2)
+            try:
+                reconcile_capital_flows(cash_live, live_equity=eq_live, config=config)
+            except Exception:
+                pass
+
             return {
                 "positions": positions,
-                "cash": round(float(balances.get("cash", 0.0)), 2),
-                "total_equity": round(float(balances.get("total_equity", 0.0)), 2),
+                "cash": cash_live,
+                "total_equity": eq_live,
                 "buying_power": round(float(balances.get("buying_power", 0.0)), 2),
                 "mode": "LIVE",
                 "live_verified": True,
@@ -388,11 +568,6 @@ def execute_buy(
     if not is_live and not _passes_scale_in_guards():
         return None
 
-    # Circuit Breaker 2: Max Single Order Cap
-    max_single_cap = config.get("max_single_order_cad", 400.0)
-    if allocated_cash > max_single_cap:
-        allocated_cash = max_single_cap
-
     min_trade_thresh = config.get("min_trade_cad", 50.0)
     max_pos_pct = config.get("max_position_pct", 0.25)
     max_sector_pct = float(config.get("max_sector_pct", 0.35))
@@ -412,11 +587,20 @@ def execute_buy(
                 return None
             account_id = config.get("account_id") or client.get_primary_account_id()
 
-            # Circuit Breaker 3: Daily Drawdown Limit vs Previous Day Close ($40 CAD / 4%)
+            # Circuit Breaker 2 & 3: Dynamic Order Cap + Cash-Flow-Adjusted Daily Drawdown Limit (4% of ref NAV)
             balances = client.get_balances(account_id)
-            total_equity = balances.get("total_equity", 1000.0)
+            total_equity = float(balances.get("total_equity", 1000.0))
+            cash_available = float(balances.get("cash", 0.0))
+            try:
+                reconcile_capital_flows(cash_available, live_equity=total_equity, config=config)
+            except Exception:
+                pass
+            max_single_cap = get_effective_order_cap(config, total_equity)
+            if allocated_cash > max_single_cap:
+                allocated_cash = max_single_cap
+
             ref_nav = _get_reference_nav(config)
-            daily_loss_limit = config.get("daily_loss_limit_cad", 40.0)
+            daily_loss_limit = get_effective_daily_loss_limit(config, ref_nav)
             drawdown = ref_nav - total_equity
             if drawdown >= daily_loss_limit:
                 print(f"[MAPLE CIRCUIT BREAKER] Daily loss limit exceeded vs prev close (${ref_nav:.2f}): -${drawdown:.2f} >= ${daily_loss_limit:.2f}. All buying halted.")
@@ -647,6 +831,9 @@ def execute_buy(
     state = get_ledger_state()
     cash = state["cash"]
     total_equity = state.get("total_equity", cash)
+    max_single_cap = get_effective_order_cap(config, total_equity)
+    if allocated_cash > max_single_cap:
+        allocated_cash = max_single_cap
     existing_pos = state["positions"].get(ticker, {})
     current_shares = existing_pos.get("shares", 0.0)
     existing_acb = existing_pos.get("acb", current_price)

@@ -466,7 +466,42 @@ def run_checks():
     wk = maple_optimizer.get_weekly_summary("2026-10-30", 936.73)
     assert wk and wk["base_date"] == "2026-10-23" and wk["wow_pnl"] == -15.94 and wk["wow_pct"] == -1.67, f"Weekly summary math mismatch: {wk}"
 
-    print("ALL 17 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 18. Nov 3 CAD $4,000 Deposit Scaling: auto-reconciliation, dynamic 25% order cap, 4% daily loss breaker & cash-flow-adjusted TWR
+    dep_cfg = {
+        "trading_mode": "LIVE",
+        "initial_cash": 1000.0,
+        "max_single_order_cad": 400.0,
+        "max_position_pct": 0.25,
+        "daily_loss_limit_cad": 40.0,
+        "daily_loss_limit_pct": 0.04,
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "capital_contributions": {},
+    }
+    with patch.object(maple_ledger, "save_config"):
+        # Stock sale alone (cash up, equity flat) must NOT be misclassified as an external deposit
+        assert maple_ledger.reconcile_capital_flows(907.93, live_equity=948.43, config=dep_cfg, today_str="2026-11-03") == 0.0
+        # Real $4,000 deposit moves BOTH cash (+$4,000) and equity (+$4,025)
+        inflow = maple_ledger.reconcile_capital_flows(4359.63, live_equity=4961.73, config=dep_cfg, today_str="2026-11-03")
+        assert inflow == 4000.0 and dep_cfg["capital_contributions"] == {"2026-11-03": 4000.0}, f"Deposit auto-detect failed: {inflow}, {dep_cfg}"
+        # Second scan on same day must NOT double-count the $4,000 deposit
+        inflow_repeat = maple_ledger.reconcile_capital_flows(4359.63, live_equity=4961.73, config=dep_cfg, today_str="2026-11-03")
+        assert inflow_repeat == 0.0 and dep_cfg["capital_contributions"] == {"2026-11-03": 4000.0}
+
+    assert maple_ledger.get_effective_order_cap(dep_cfg, 936.73) == 400.0
+    assert maple_ledger.get_effective_order_cap(dep_cfg, 4961.73) == 1240.43
+    assert maple_ledger.get_effective_daily_loss_limit(dep_cfg, 4936.73) == 197.47
+    assert maple_ledger.get_total_invested_capital(dep_cfg, up_to_date="2026-11-03") == 5000.0
+
+    # At $4,961.73 (+$25.00 trading gain on top of $936.73 + $4,000 deposit): TWR reflects true performance, NOT +396%
+    twr_at_deposit = maple_ledger.compute_twr_pct(4936.73, config=dep_cfg, today_str="2026-11-03")
+    twr_plus_25 = maple_ledger.compute_twr_pct(4961.73, config=dep_cfg, today_str="2026-11-03")
+    assert twr_at_deposit == -6.33 and twr_plus_25 == -5.85, f"Unexpected TWR across $4,000 deposit: {twr_at_deposit}, {twr_plus_25}"
+
+    wk_dep = maple_optimizer.get_weekly_summary("2026-11-06", 5010.00, config=dep_cfg)
+    assert wk_dep and wk_dep["wow_pnl"] == 73.27 and wk_dep["wow_pct"] == 1.48, f"Deposit-week WoW math distorted: {wk_dep}"
+
+    print("ALL 18 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from typing import Dict, Any, Tuple
 import yfinance as yf
 
 from maple_market import get_stock_data
-from maple_ledger import get_ledger_state, load_config
+from maple_ledger import get_ledger_state, load_config, get_total_invested_capital, compute_twr_pct
 
 MAPLE_DIR = os.path.dirname(os.path.abspath(__file__))
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
@@ -108,8 +108,9 @@ def generate_comparison_report() -> str:
         maple_nav = get_portfolio_nav(maple_raw["positions"], maple_raw["cash"])
 
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    maple_baseline = float(config.get("initial_cash", 1000.0))
-    maple_return = ((maple_nav["nav"] - maple_baseline) / maple_baseline) * 100.0 if maple_baseline > 0 else 0.0
+    maple_raw_cfg = load_config()
+    maple_baseline = get_total_invested_capital(maple_raw_cfg)
+    maple_return = compute_twr_pct(maple_nav["nav"], config=maple_raw_cfg)
     bench_date, tsx_return = _get_tsx60_benchmark_return()
 
     report = []

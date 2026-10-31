@@ -32,6 +32,9 @@ from maple_ledger import (
     load_config,
     save_config,
     get_ledger_state,
+    get_net_contributions,
+    get_total_invested_capital,
+    compute_twr_pct,
     get_ticker_sector,
     get_position_holding_days,
     get_position_last_buy_info,
@@ -76,18 +79,25 @@ def save_nav_snapshot(date_str: str, nav: float, cash: float, positions: Dict[st
         json.dump(history, f, indent=4)
 
 
-def get_previous_close_nav(today_str: str) -> Optional[float]:
+def get_previous_close_info(today_str: str) -> Tuple[Optional[str], Optional[float]]:
     history = load_nav_history()
-    # Find the most recent date before today
     previous_dates = [d for d in sorted(history.keys()) if d < today_str]
     if previous_dates:
         last_date = previous_dates[-1]
-        return history[last_date].get("nav")
-    return None
+        return last_date, history[last_date].get("nav")
+    return None, None
 
 
-def get_weekly_summary(today_str: str, current_equity: float) -> Optional[Dict[str, Any]]:
-    """Computes week-over-week NAV delta (vs prior week's final close) and weekly realized trade stats."""
+def get_previous_close_nav(today_str: str) -> Optional[float]:
+    return get_previous_close_info(today_str)[1]
+
+
+def get_weekly_summary(
+    today_str: str,
+    current_equity: float,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Computes cash-flow-adjusted week-over-week NAV delta and weekly realized trade stats."""
     history = load_nav_history()
     today_dt = datetime.date.fromisoformat(today_str[:10])
     monday_str = (today_dt - datetime.timedelta(days=today_dt.weekday())).isoformat()
@@ -102,8 +112,10 @@ def get_weekly_summary(today_str: str, current_equity: float) -> Optional[Dict[s
     if base_nav <= 0:
         return None
 
-    wow_pnl = round(current_equity - base_nav, 2)
-    wow_pct = round((wow_pnl / base_nav) * 100.0, 2)
+    week_flows = get_net_contributions(config, after_date=base_date, up_to_date=today_str)
+    adj_base_nav = base_nav + week_flows
+    wow_pnl = round(current_equity - adj_base_nav, 2)
+    wow_pct = round((wow_pnl / adj_base_nav) * 100.0, 2) if adj_base_nav > 0 else 0.0
 
     wins, losses, buy_count = 0, 0, 0
     net_realized = 0.0
@@ -359,10 +371,10 @@ def run_daily_self_assessment():
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     print(f"\n[MAPLE DAILY RETROSPECTIVE] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+    state = get_ledger_state()
     config = load_config()
     is_live = config.get("trading_mode", "").upper() == "LIVE"
     allowed_tickers = config.get("allowed_tickers", [])
-    state = get_ledger_state()
 
     cash = float(state.get("cash", 0.0))
     equity = float(state.get("total_equity", cash))
@@ -404,8 +416,16 @@ def run_daily_self_assessment():
         )
     basket_pct = round(sum(basket_gains) / len(basket_gains), 2) if basket_gains else None
 
-    # 1. Historical NAV Tracking & Daily Delta
-    prev_equity = get_previous_close_nav(today_str)
+    # 1. Historical NAV Tracking & Cash-Flow-Adjusted Daily/Cumulative Delta
+    prev_date, raw_prev_equity = get_previous_close_info(today_str)
+    day_flows = (
+        get_net_contributions(config, after_date=prev_date, up_to_date=today_str)
+        if prev_date
+        else get_net_contributions(config, up_to_date=today_str)
+    )
+    prev_equity = round(float(raw_prev_equity) + day_flows, 2) if raw_prev_equity else None
+    invested_capital = get_total_invested_capital(config, up_to_date=today_str)
+    twr_pct = compute_twr_pct(equity, config=config, today_str=today_str)
     if not is_live or state.get("live_verified", False):
         save_nav_snapshot(today_str, equity, cash, positions)
     else:
@@ -413,8 +433,8 @@ def run_daily_self_assessment():
 
     daily_pnl = round(equity - prev_equity, 2) if prev_equity else 0.0
     daily_pct = round((daily_pnl / prev_equity) * 100, 2) if prev_equity else 0.0
-    cum_pnl = round(equity - 1000.0, 2)
-    cum_pct = round((cum_pnl / 1000.0) * 100, 2)
+    cum_pnl = round(equity - invested_capital, 2)
+    cum_pct = round((cum_pnl / invested_capital) * 100, 2) if invested_capital > 0 else 0.0
 
     # 2. Today's Executions (BUY Entries & Realized SELL Exits)
     buy_trades = get_daily_buy_trades(today_str)
@@ -439,6 +459,10 @@ def run_daily_self_assessment():
     missed = scan_missed_opportunities(norm_allowed, prefetched=prefetched)
     changes_made = []
     audit_flags = []
+    if abs(day_flows) >= 1.0:
+        audit_flags.append(
+            f"[CAPITAL FLOW] Settled external cash flow CAD {day_flows:+.2f} today; Daily/Weekly/TWR returns cash-flow adjusted."
+        )
 
     for sym in held_syms:
         c_info = cal_map.get(sym, {})
@@ -473,16 +497,17 @@ def run_daily_self_assessment():
 
     # 5. Build Comprehensive Quantitative Changelog Entry
     is_friday = datetime.date.fromisoformat(today_str).weekday() == 4
-    weekly_summary = get_weekly_summary(today_str, equity) if is_friday else None
+    weekly_summary = get_weekly_summary(today_str, equity, config=config) if is_friday else None
     session_hdr = (
         "Weekly & Daily Market Close Performance Assessment"
         if is_friday
         else "Daily Market Close Performance Assessment"
     )
+    day_lbl = "vs Cash-Flow-Adjusted Prior Close" if abs(day_flows) >= 1.0 else "vs Previous Close"
     report = [
         f"**Session Type:** {session_hdr}",
         f"**Portfolio Equity NAV:** CAD {equity:.2f}",
-        f"**Daily NAV Change:** CAD {daily_pnl:+.2f} ({daily_pct:+.2f}%) vs Previous Close",
+        f"**Daily NAV Change:** CAD {daily_pnl:+.2f} ({daily_pct:+.2f}%) {day_lbl}",
     ]
     if weekly_summary:
         report.append(
@@ -494,8 +519,14 @@ def run_daily_self_assessment():
         report.append(
             f"**Universe Benchmark (32 TSX Equal-Wt):** {basket_pct:+.2f}% | **Relative Alpha:** {daily_pct - basket_pct:+.2f}%"
         )
+    has_contribs = abs(invested_capital - float(config.get("initial_cash", 1000.0))) >= 1.0
+    cum_line = (
+        f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}% on CAD {invested_capital:,.2f} contributed | TWR: {twr_pct:+.2f}%)"
+        if has_contribs
+        else f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}%) vs CAD {invested_capital:,.2f} seed"
+    )
     report.extend([
-        f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}%) vs CAD 1,000.00 seed",
+        cum_line,
         f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {equity-cash:.2f} ({(equity-cash)/equity*100:.1f}%)",
     ])
 
@@ -562,6 +593,8 @@ def run_daily_self_assessment():
             equity=equity,
             positions=positions,
             prev_equity=prev_equity,
+            invested_capital=invested_capital,
+            twr_pct=twr_pct,
             realized_trades=realized_trades,
             buy_trades=buy_trades,
             basket_pct=basket_pct,
