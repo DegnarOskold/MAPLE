@@ -245,6 +245,8 @@ def send_retrospective_report(
     buy_trades: Optional[List[Dict[str, Any]]] = None,
     basket_pct: Optional[float] = None,
     weekly_summary: Optional[Dict[str, Any]] = None,
+    invested_capital: float = 1000.0,
+    twr_pct: Optional[float] = None,
 ) -> bool:
     """
     Sends an institutional, quantitative daily performance report.
@@ -263,10 +265,12 @@ def send_retrospective_report(
     is_friday = (str(session_type).upper() == "WEEKLY") or (datetime.datetime.now().weekday() == 4)
     period_label = "Weekly Close Performance Report" if is_friday else "Daily Close Performance Report"
 
-    # Cumulative Return vs $1,000 baseline
-    cum_pnl = equity - 1000.0
-    cum_pct = (cum_pnl / 1000.0) * 100
+    # Cumulative Return vs total contributed capital
+    inv_cap = float(invested_capital) if invested_capital and invested_capital > 0 else 1000.0
+    cum_pnl = equity - inv_cap
+    cum_pct = (cum_pnl / inv_cap) * 100.0
     cum_sign = "+" if cum_pnl >= 0 else ""
+    twr_tag = f" | TWR: {twr_pct:+.2f}%" if (twr_pct is not None and abs(inv_cap - 1000.0) >= 1.0) else ""
 
     # Daily Return vs previous close (if available)
     daily_pct = 0.0
@@ -300,7 +304,7 @@ def send_retrospective_report(
             f"• <b>32-Ticker Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
         )
     lines.extend([
-        f"• <b>Cumulative P&L (Inception):</b> {cum_sign}CAD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%)",
+        f"• <b>Cumulative P&L (Inception):</b> {cum_sign}CAD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%{twr_tag})",
         f"• <b>Capital Allocation:</b> Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {market_val:.2f} ({market_val/equity*100:.1f}%)",
     ])
 

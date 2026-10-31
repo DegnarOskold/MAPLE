@@ -27,6 +27,7 @@ from maple_market import (
 )
 from maple_ledger import (
     get_ledger_state,
+    get_effective_order_cap,
     execute_buy,
     execute_sell,
     check_target_stops,
@@ -417,8 +418,9 @@ def run_intraday_scan(bot_advice: str = ""):
     else:
         macro_state = get_macro_alignment()
         nav_est = float(ledger_state.get("total_equity") or ledger_state.get("cash", 0.0))
+        eff_order_cap = get_effective_order_cap(config, nav_est)
         max_share_px = min(
-            float(config.get("max_single_order_cad", 400.0)),
+            eff_order_cap,
             nav_est * max(float(config.get("max_position_pct", 0.25)), float(config.get("max_single_share_nav_pct", 0.30))),
         )
         held_set = {normalize_ticker(t) for t, p in ledger_state.get("positions", {}).items() if p.get("shares", 0) > 0}
