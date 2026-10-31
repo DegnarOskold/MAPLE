@@ -1292,10 +1292,21 @@ def check_target_stops(
             print(f"[MAPLE] Order #{pend_id} already active for {ticker}. Skipping duplicate order submission.")
             continue
 
-        # 0. Breakeven Stop Ratchet: Once unrealized gain >= +2.0%, ratchet stop up to breakeven
+        # 0. Breakeven Stop Ratchet: Once unrealized gain >= +2.0% (or any >= +0.3% green cushion within <= 3 trading days of earnings)
+        sd_pos = None
+        if market_data:
+            for alias in ticker_aliases(ticker):
+                if alias in market_data and market_data[alias]:
+                    sd_pos = market_data[alias]
+                    break
+        earn_td = sd_pos.get("trading_days_to_earnings") if sd_pos else None
+        if earn_td is None and sd_pos:
+            earn_td = sd_pos.get("days_to_earnings")
+        near_earnings = isinstance(earn_td, (int, float)) and 0 <= earn_td <= 3
+
         if acb > 0 and price > acb:
             gain_pct = ((price - acb) / acb) * 100.0
-            if gain_pct >= MapleStrategy.BREAKEVEN_TRIGGER_PCT:
+            if gain_pct >= MapleStrategy.BREAKEVEN_TRIGGER_PCT or (near_earnings and price >= round(acb * 1.003, 2)):
                 comm_per_order = float(config.get("commission_per_order_cad", MapleStrategy.COMMISSION_PER_ORDER_CAD))
                 # IBKR LIVE avgCost (acb) already includes entry commission; SIMULATED acb is raw fill price
                 comm_mult = 1.0 if (state.get("mode") == "LIVE" and state.get("live_verified")) else 2.0
@@ -1309,8 +1320,9 @@ def check_target_stops(
                     config.setdefault("active_targets", {}).setdefault(matched_alias, {})["target_price"] = target
                     config["active_targets"][matched_alias]["stop_loss_price"] = stop
                     save_config(config)
+                    tag = "EARNINGS BREAKEVEN RATCHET" if (near_earnings and gain_pct < MapleStrategy.BREAKEVEN_TRIGGER_PCT) else "BREAKEVEN RATCHET"
                     print(
-                        f"[MAPLE BREAKEVEN RATCHET] Ratcheted stop-loss for {ticker} from CAD {old_stop} to breakeven CAD {stop:.2f} (Price CAD {price:.2f}, +{gain_pct:.2f}%)"
+                        f"[MAPLE {tag}] Ratcheted stop-loss for {ticker} from CAD {old_stop} to breakeven CAD {stop:.2f} (Price CAD {price:.2f}, +{gain_pct:.2f}%)"
                     )
 
         # 1. Target Hit

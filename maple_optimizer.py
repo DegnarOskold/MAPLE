@@ -27,7 +27,7 @@ CHANGELOG_FILE = os.path.join(MAPLE_DIR, "maple_logic_changelog.md")
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
 TRADES_FILE = os.path.join(MAPLE_DIR, "maple_trades.csv")
 
-from maple_market import get_stock_data, prefetch_histories
+from maple_market import get_stock_data, get_corporate_calendar, prefetch_histories
 from maple_ledger import (
     load_config,
     save_config,
@@ -84,6 +84,63 @@ def get_previous_close_nav(today_str: str) -> Optional[float]:
         last_date = previous_dates[-1]
         return history[last_date].get("nav")
     return None
+
+
+def get_weekly_summary(today_str: str, current_equity: float) -> Optional[Dict[str, Any]]:
+    """Computes week-over-week NAV delta (vs prior week's final close) and weekly realized trade stats."""
+    history = load_nav_history()
+    today_dt = datetime.date.fromisoformat(today_str[:10])
+    monday_str = (today_dt - datetime.timedelta(days=today_dt.weekday())).isoformat()
+    prior_dates = [d for d in sorted(history.keys()) if d < monday_str]
+    if not prior_dates:
+        prior_dates = [d for d in sorted(history.keys()) if d < today_str][:1]
+    if not prior_dates:
+        return None
+
+    base_date = prior_dates[-1]
+    base_nav = float(history[base_date].get("nav") or 0.0)
+    if base_nav <= 0:
+        return None
+
+    wow_pnl = round(current_equity - base_nav, 2)
+    wow_pct = round((wow_pnl / base_nav) * 100.0, 2)
+
+    wins, losses, buy_count = 0, 0, 0
+    net_realized = 0.0
+    if os.path.exists(TRADES_FILE):
+        import re
+        try:
+            with open(TRADES_FILE, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    d_str = row.get("Date", "")[:10]
+                    if not (monday_str <= d_str <= today_str):
+                        continue
+                    act = row.get("Action", "").strip().upper()
+                    if act == "BUY":
+                        buy_count += 1
+                    elif act == "SELL":
+                        m = re.search(r"P&L:\s*\$?([-+]?[0-9]*\.?[0-9]+)", row.get("Notes", ""))
+                        if m:
+                            pval = float(m.group(1))
+                            net_realized += pval
+                            if pval > 0:
+                                wins += 1
+                            else:
+                                losses += 1
+        except Exception:
+            pass
+
+    return {
+        "base_date": base_date,
+        "base_nav": round(base_nav, 2),
+        "wow_pnl": wow_pnl,
+        "wow_pct": wow_pct,
+        "buy_count": buy_count,
+        "closed_count": wins + losses,
+        "wins": wins,
+        "losses": losses,
+        "net_realized_pnl": round(net_realized, 2),
+    }
 
 
 def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
@@ -153,7 +210,8 @@ def get_daily_buy_trades(today_str: str) -> List[Dict[str, Any]]:
 
 def calculate_position_attribution(
     positions: Dict[str, Any],
-    total_equity: float
+    total_equity: float,
+    calendar_map: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Computes performance and risk metrics for each held position:
@@ -225,6 +283,14 @@ def calculate_position_attribution(
             notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
         if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
             notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
+
+        cal_info = (calendar_map or {}).get(normalize_ticker(sym), {})
+        earn_td = cal_info.get("trading_days_to_earnings")
+        if earn_td is None:
+            earn_td = cal_info.get("days_to_earnings")
+        if isinstance(earn_td, (int, float)) and 0 <= earn_td <= 3:
+            ed_str = cal_info.get("earnings_date", "Soon")
+            notes.append(f"Earnings risk in {int(earn_td)} trading day(s) ({ed_str})")
 
         if notes:
             item_copy = dict(item)
@@ -355,7 +421,9 @@ def run_daily_self_assessment():
     realized_trades = get_daily_realized_trades(today_str)
 
     # 3. Position Attribution, Sector Concentration & Risk Watchlist
-    attribution, risk_watchlist = calculate_position_attribution(positions, equity)
+    held_syms = [normalize_ticker(s) for s, p in positions.items() if float(p.get("shares", 0)) > 0]
+    cal_map = get_corporate_calendar(held_syms) if held_syms else {}
+    attribution, risk_watchlist = calculate_position_attribution(positions, equity, calendar_map=cal_map)
     max_sector_pct = float(config.get("max_sector_pct", 0.35)) * 100.0
     sector_totals: Dict[str, float] = {}
     for pa in attribution:
@@ -371,6 +439,14 @@ def run_daily_self_assessment():
     missed = scan_missed_opportunities(norm_allowed, prefetched=prefetched)
     changes_made = []
     audit_flags = []
+
+    for sym in held_syms:
+        c_info = cal_map.get(sym, {})
+        e_td = c_info.get("trading_days_to_earnings")
+        if isinstance(e_td, (int, float)) and 0 <= e_td <= 3:
+            audit_flags.append(
+                f"[EARNINGS WATCH] Held {sym} reports in {int(e_td)} trading day(s) ({c_info.get('earnings_date', 'Soon')}); stop auto-ratchets to breakeven if green."
+            )
 
     for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
         sec_pct = (val / equity * 100.0) if equity > 0 else 0.0
@@ -396,11 +472,24 @@ def run_daily_self_assessment():
             print(f"  * {m['ticker']}: +{m['day_gain']}% today, +{m['pct_from_low']}% from low (RSI: {m['rsi']}, Vol: {m['vol_ratio']}x | {m.get('gate_status', '')})")
 
     # 5. Build Comprehensive Quantitative Changelog Entry
+    is_friday = datetime.date.fromisoformat(today_str).weekday() == 4
+    weekly_summary = get_weekly_summary(today_str, equity) if is_friday else None
+    session_hdr = (
+        "Weekly & Daily Market Close Performance Assessment"
+        if is_friday
+        else "Daily Market Close Performance Assessment"
+    )
     report = [
-        f"**Session Type:** Daily Market Close Performance Assessment",
+        f"**Session Type:** {session_hdr}",
         f"**Portfolio Equity NAV:** CAD {equity:.2f}",
         f"**Daily NAV Change:** CAD {daily_pnl:+.2f} ({daily_pct:+.2f}%) vs Previous Close",
     ]
+    if weekly_summary:
+        report.append(
+            f"**Weekly NAV Change (vs {weekly_summary['base_date']}):** CAD {weekly_summary['wow_pnl']:+.2f} "
+            f"({weekly_summary['wow_pct']:+.2f}%) | **Weekly Realized ({weekly_summary['closed_count']} exits: "
+            f"{weekly_summary['wins']}W/{weekly_summary['losses']}L):** CAD {weekly_summary['net_realized_pnl']:+.2f}"
+        )
     if basket_pct is not None and prev_equity:
         report.append(
             f"**Universe Benchmark (32 TSX Equal-Wt):** {basket_pct:+.2f}% | **Relative Alpha:** {daily_pct - basket_pct:+.2f}%"
@@ -468,7 +557,7 @@ def run_daily_self_assessment():
     try:
         from telegram_notifier import send_retrospective_report
         send_retrospective_report(
-            session_type="DAILY",
+            session_type="WEEKLY" if is_friday else "DAILY",
             cash=cash,
             equity=equity,
             positions=positions,
@@ -476,6 +565,7 @@ def run_daily_self_assessment():
             realized_trades=realized_trades,
             buy_trades=buy_trades,
             basket_pct=basket_pct,
+            weekly_summary=weekly_summary,
             position_attribution=attribution,
             risk_watchlist=risk_watchlist,
             missed_opportunities=missed,
