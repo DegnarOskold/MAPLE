@@ -316,6 +316,7 @@ def run_chop_exit_guard() -> Dict[str, Any]:
     config = load_config()
     is_live = config.get("trading_mode", "").upper() == "LIVE"
     price_map = {}
+    chop_mkt = {}
 
     # Step 1: Fetch real-time TSX quotes via yfinance first
     for t in tickers:
@@ -323,6 +324,7 @@ def run_chop_exit_guard() -> Dict[str, Any]:
             sd = get_stock_data(t, mode="SHORT")
             if sd and sd.get("Price") not in ("N/A", None):
                 price_map[t] = float(sd["Price"])
+                chop_mkt[t] = sd
         except Exception:
             pass
 
@@ -366,7 +368,7 @@ def run_chop_exit_guard() -> Dict[str, Any]:
         print(f"  * {t}: Current CAD {p:.2f} | Target: CAD {tgt} | Stop: {stp_disp}")
 
     # Evaluate target and opening-chop buffered stop triggers
-    check_target_stops(price_map, is_chop_window=True)
+    check_target_stops(price_map, market_data=chop_mkt, is_chop_window=True)
 
     print(f"[MAPLE CHOP EXIT GUARD COMPLETE] {datetime.datetime.now().strftime('%H:%M:%S')} ET\n")
     return {"status": "SUCCESS", "monitored": tickers}

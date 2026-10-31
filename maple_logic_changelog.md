@@ -608,3 +608,5 @@ This document tracks all autonomous logic and parameter adaptations made by MAPL
 
 **Autonomous Risk & Strategy Audit:**
 - [SIGNAL ATTRIBUTION] Today's BUY fills (2): 1 Regular Trend, 1 Low-Volume Scaled, 0 Capitulation Reversal.
+- [POST-MOC RECONCILIATION] Settled TSX MOC marks (`5d` overlay): `SU.TO` CAD 111.11 (-0.01 net / +0.54 gross), `CNQ.TO` CAD 78.42 (+2.76 net), `RCH.TO` CAD 37.59 (-2.19 net), `CCL-B.TO` CAD 98.19 (-0.30 net) -> **Settled Friday NAV: CAD 936.73** (-CAD 9.94 / -1.05% Daily vs -2.37% Basket = +1.32% Alpha; **-CAD 15.94 / -1.67% WoW** vs 2026-10-23 CAD 952.67).
+- [EARNINGS WATCH] Held `SU.TO` reports 2026-11-03 (2 trading days from Fri / 1 on Mon); stop auto-ratchets to breakeven if green.

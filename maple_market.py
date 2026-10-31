@@ -10,6 +10,7 @@ import time
 import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
@@ -34,7 +35,42 @@ def _now_et() -> datetime.datetime:
     return datetime.datetime.now()
 
 
-def get_corporate_calendar(tickers: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+def _refresh_calendar_days(
+    calendar_data: Dict[str, Dict[str, Any]],
+    ref_date: Optional[datetime.date] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Dynamically recomputes calendar and trading-day deltas from cached ISO dates on every read."""
+    today = ref_date or _now_et().date()
+    today_iso = today.isoformat()
+    out: Dict[str, Dict[str, Any]] = {}
+    for sym, entry in calendar_data.items():
+        rec = dict(entry)
+        ed_str = str(rec.get("earnings_date", "N/A"))
+        if ed_str and ed_str != "N/A":
+            try:
+                ed_date = datetime.date.fromisoformat(ed_str[:10])
+                rec["days_to_earnings"] = (ed_date - today).days
+                rec["trading_days_to_earnings"] = int(np.busday_count(today_iso, ed_date.isoformat()))
+            except ValueError:
+                pass
+        else:
+            rec.setdefault("trading_days_to_earnings", None)
+
+        ex_str = str(rec.get("ex_dividend_date", "N/A"))
+        if ex_str and ex_str != "N/A":
+            try:
+                ex_date = datetime.date.fromisoformat(ex_str[:10])
+                rec["days_to_ex_dividend"] = (ex_date - today).days
+            except ValueError:
+                pass
+        out[sym] = rec
+    return out
+
+
+def get_corporate_calendar(
+    tickers: Optional[List[str]] = None,
+    ref_date: Optional[datetime.date] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Fetches and caches upcoming earnings and ex-dividend dates locally in MAPLE (24h TTL)."""
     cache_ts = 0.0
     calendar_data: Dict[str, Dict[str, Any]] = {}
@@ -52,9 +88,9 @@ def get_corporate_calendar(tickers: Optional[List[str]] = None) -> Dict[str, Dic
     req_tickers = list(tickers or [])
     missing = [t for t in req_tickers if t not in calendar_data]
     if not missing and calendar_data:
-        return calendar_data
+        return _refresh_calendar_days(calendar_data, ref_date=ref_date)
 
-    now_date = datetime.date.today()
+    now_date = ref_date or _now_et().date()
     for t in missing:
         ed_str, days_to_ed, ex_div_str, days_to_ex_div = "N/A", None, "N/A", None
         try:
@@ -86,21 +122,97 @@ def get_corporate_calendar(tickers: Optional[List[str]] = None) -> Dict[str, Dic
     except Exception:
         pass
 
-    return calendar_data
+    return _refresh_calendar_days(calendar_data, ref_date=now_date)
+
+
+def _is_tsx_regular_hours(now_et: Optional[datetime.datetime] = None) -> bool:
+    dt = now_et or _now_et()
+    if dt.weekday() >= 5:
+        return False
+    open_dt = dt.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_dt = dt.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_dt <= dt < close_dt
+
+
+def _overlay_fresh_bar(
+    df: pd.DataFrame,
+    df_5d: Optional[pd.DataFrame] = None,
+    df_1m: Optional[pd.DataFrame] = None,
+    today_date: Optional[datetime.date] = None,
+) -> pd.DataFrame:
+    """Overlays uncached 5d daily (MOC-settled) and intraday 1m OHLCV onto Yahoo's CDN-cached 6mo frame."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    ohlcv_cols = ("Open", "High", "Low", "Close", "Volume")
+
+    if df_5d is not None and not df_5d.empty:
+        clean_5d = df_5d.dropna(subset=["Close"])
+        if not clean_5d.empty:
+            r5 = clean_5d.iloc[-1]
+            d5 = clean_5d.index[-1].date()
+            last_d = out.index[-1].date()
+            if d5 == last_d:
+                for col in ohlcv_cols:
+                    if col in r5 and col in out.columns and pd.notna(r5[col]):
+                        out.iloc[-1, out.columns.get_loc(col)] = r5[col]
+            elif d5 > last_d:
+                new_idx = pd.Timestamp(d5, tz=out.index.tz)
+                new_row = out.iloc[-1].copy()
+                for col in ohlcv_cols:
+                    if col in r5 and pd.notna(r5[col]):
+                        new_row[col] = r5[col]
+                out.loc[new_idx] = new_row
+
+    if df_1m is not None and not df_1m.empty:
+        clean_1m = df_1m.dropna(subset=["Close"])
+        if not clean_1m.empty:
+            d1 = clean_1m.index[-1].date()
+            ref_today = today_date or _now_et().date()
+            if d1 == ref_today:
+                last_d = out.index[-1].date()
+                c_px = float(clean_1m["Close"].iloc[-1])
+                h_px = float(clean_1m["High"].dropna().max()) if "High" in clean_1m else c_px
+                l_px = float(clean_1m["Low"].dropna().min()) if "Low" in clean_1m else c_px
+                o_px = float(clean_1m["Open"].dropna().iloc[0]) if "Open" in clean_1m and not clean_1m["Open"].dropna().empty else c_px
+                v_sum = float(clean_1m["Volume"].dropna().sum()) if "Volume" in clean_1m else 0.0
+                if d1 > last_d:
+                    new_idx = pd.Timestamp(d1, tz=out.index.tz)
+                    new_row = out.iloc[-1].copy()
+                    for col, val in (("Open", o_px), ("High", h_px), ("Low", l_px), ("Close", c_px), ("Volume", v_sum)):
+                        if col in out.columns:
+                            new_row[col] = val
+                    out.loc[new_idx] = new_row
+                elif d1 == last_d:
+                    out.iloc[-1, out.columns.get_loc("Close")] = c_px
+                    out.iloc[-1, out.columns.get_loc("High")] = max(float(out["High"].iloc[-1]), h_px)
+                    out.iloc[-1, out.columns.get_loc("Low")] = min(float(out["Low"].iloc[-1]), l_px)
+                    out.iloc[-1, out.columns.get_loc("Volume")] = max(float(out["Volume"].iloc[-1]), v_sum)
+
+    return out
 
 
 def prefetch_histories(tickers: List[str], period: str = "6mo") -> Dict[str, pd.DataFrame]:
-    """Batch-downloads OHLCV histories via yfinance for fast 32-ticker scans."""
+    """Batch-downloads OHLCV histories via yfinance and overlays fresh 5d/1m bars to defeat 6mo CDN lag."""
     prefetched: Dict[str, pd.DataFrame] = {}
     if len(tickers) <= 1:
         return prefetched
     try:
         raw = yf.download(tickers, period=period, group_by="ticker", threads=True, timeout=15, progress=False)
+        raw_5d = yf.download(tickers, period="5d", group_by="ticker", threads=True, timeout=10, progress=False)
+        now_et = _now_et()
+        raw_1m = (
+            yf.download(tickers, period="1d", interval="1m", group_by="ticker", threads=True, timeout=10, progress=False)
+            if _is_tsx_regular_hours(now_et)
+            else None
+        )
         for t in tickers:
             try:
                 df = raw[t].dropna(how="all")
                 if not df.empty:
-                    prefetched[t] = df
+                    d5 = raw_5d[t].dropna(how="all") if (raw_5d is not None and t in raw_5d) else None
+                    d1 = raw_1m[t].dropna(how="all") if (raw_1m is not None and t in raw_1m) else None
+                    prefetched[t] = _overlay_fresh_bar(df, df_5d=d5, df_1m=d1, today_date=now_et.date())
             except Exception:
                 pass
     except Exception:
@@ -129,6 +241,11 @@ def get_stock_data(
             hist = prefetched_hist.copy()
         else:
             hist = ticker.history(period="6mo", timeout=10)
+            if hist is not None and not hist.empty:
+                now_et = _now_et()
+                h5 = ticker.history(period="5d", timeout=8)
+                h1 = ticker.history(period="1d", interval="1m", timeout=8) if _is_tsx_regular_hours(now_et) else None
+                hist = _overlay_fresh_bar(hist, df_5d=h5, df_1m=h1, today_date=now_et.date())
         if hist is None or hist.empty:
             return None
 
@@ -207,6 +324,8 @@ def get_stock_data(
                 "Low": round(float(latest["Low"]), 2),
                 "Price": round(price, 2),
                 "Volume": int(latest["Volume"]),
+                "Vol_SMA_10": round(vol_sma_10, 0),
+                "Intraday_Dollar_Vol": round(float(latest["Volume"]) * price, 2),
                 "Vol_Ratio": round(vol_ratio, 2),
                 "EMA_Crossover": crossover,
                 "EMA_5": round(ema_5, 2) if ema_5 > 0 else "N/A",
@@ -219,6 +338,7 @@ def get_stock_data(
                 "BB_Upper": round(float(latest[bb_upper_col]), 2) if bb_upper_col and pd.notna(latest[bb_upper_col]) else "N/A",
                 "earnings_date": cal.get("earnings_date", "N/A"),
                 "days_to_earnings": cal.get("days_to_earnings"),
+                "trading_days_to_earnings": cal.get("trading_days_to_earnings"),
                 "ex_dividend_date": cal.get("ex_dividend_date", "N/A"),
                 "days_to_ex_dividend": cal.get("days_to_ex_dividend"),
             }
@@ -242,6 +362,7 @@ def get_stock_data(
             "BB_Upper": round(float(latest[bb_upper_col]), 2) if bb_upper_col and pd.notna(latest[bb_upper_col]) else "N/A",
             "earnings_date": cal.get("earnings_date", "N/A"),
             "days_to_earnings": cal.get("days_to_earnings"),
+            "trading_days_to_earnings": cal.get("trading_days_to_earnings"),
             "ex_dividend_date": cal.get("ex_dividend_date", "N/A"),
             "days_to_ex_dividend": cal.get("days_to_ex_dividend"),
         }

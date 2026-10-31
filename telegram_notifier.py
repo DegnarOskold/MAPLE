@@ -244,6 +244,7 @@ def send_retrospective_report(
     notes: str = "",
     buy_trades: Optional[List[Dict[str, Any]]] = None,
     basket_pct: Optional[float] = None,
+    weekly_summary: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Sends an institutional, quantitative daily performance report.
@@ -259,7 +260,7 @@ def send_retrospective_report(
         return False
 
     now_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    is_friday = datetime.datetime.now().weekday() == 4
+    is_friday = (str(session_type).upper() == "WEEKLY") or (datetime.datetime.now().weekday() == 4)
     period_label = "Weekly Close Performance Report" if is_friday else "Daily Close Performance Report"
 
     # Cumulative Return vs $1,000 baseline
@@ -285,6 +286,15 @@ def send_retrospective_report(
         f"• <b>Closing Equity NAV:</b> <b>CAD {equity:.2f}</b>",
         daily_nav_str,
     ]
+    if weekly_summary:
+        w_pnl = float(weekly_summary.get("wow_pnl", 0.0))
+        w_pct = float(weekly_summary.get("wow_pct", 0.0))
+        r_pnl = float(weekly_summary.get("net_realized_pnl", 0.0))
+        lines.append(
+            f"• <b>Weekly NAV Change (vs {weekly_summary.get('base_date', 'Prior Fri')}):</b> "
+            f"{w_pnl:+.2f} CAD ({w_pct:+.2f}% WoW) | Realized: "
+            f"{weekly_summary.get('wins', 0)}W/{weekly_summary.get('losses', 0)}L ({r_pnl:+.2f} CAD)"
+        )
     if basket_pct is not None and prev_equity and prev_equity > 0:
         lines.append(
             f"• <b>32-Ticker Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"

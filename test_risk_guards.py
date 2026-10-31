@@ -396,7 +396,77 @@ def run_checks():
         atz_movers = maple_optimizer.scan_missed_opportunities(["ATZ.TO"])
         assert "(68.0)" in atz_movers[0]["gate_status"], f"Gate status truncated mid-number: {atz_movers}"
 
-    print("ALL 16 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 17. Oct 30 Retrospective Patches: 5d/1m fresh bar overlay, dynamic trading-day earnings + green breakeven ratchet, thin-liquidity cap & Friday WoW summary
+    import pandas as pd
+    stale_6mo = pd.DataFrame(
+        {"Open": [108.5, 109.2], "High": [110.0, 110.8], "Low": [108.0, 109.0], "Close": [108.65, 110.12], "Volume": [3000000, 2100000]},
+        index=pd.to_datetime(["2026-10-29", "2026-10-30"]),
+    )
+    fresh_5d = pd.DataFrame(
+        {"Open": [109.2], "High": [111.3], "Low": [109.0], "Close": [111.11], "Volume": [3676072]},
+        index=pd.to_datetime(["2026-10-30"]),
+    )
+    merged_eod = maple_market._overlay_fresh_bar(stale_6mo, df_5d=fresh_5d)
+    assert float(merged_eod["Close"].iloc[-1]) == 111.11 and int(merged_eod["Volume"].iloc[-1]) == 3676072
+
+    fresh_1m = pd.DataFrame(
+        {"Open": [110.2], "High": [111.6], "Low": [108.9], "Close": [111.55], "Volume": [3700000]},
+        index=pd.DatetimeIndex(["2026-10-30 15:45:00-04:00"]),
+    )
+    merged_intraday = maple_market._overlay_fresh_bar(stale_6mo, df_5d=fresh_5d, df_1m=fresh_1m, today_date=datetime.date(2026, 10, 30))
+    assert float(merged_intraday["Close"].iloc[-1]) == 111.55 and float(merged_intraday["High"].iloc[-1]) == 111.6
+
+    refreshed_cal = maple_market._refresh_calendar_days(
+        {"SU.TO": {"earnings_date": "2026-11-03", "days_to_earnings": 99, "ex_dividend_date": "N/A"}},
+        ref_date=datetime.date(2026, 10, 30),  # Friday -> Tuesday = 4 calendar days, 2 trading days
+    )
+    assert refreshed_cal["SU.TO"]["days_to_earnings"] == 4 and refreshed_cal["SU.TO"]["trading_days_to_earnings"] == 2
+    su_gate, su_reason = MapleStrategy.calculate_tranche_size(
+        {"Price": 110.57, "Open": 109.20, "EMA_5": 109.8, "EMA_9": 109.1, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 0.95, "ADX_14": 25.0, "RSI_7": 55.0, **refreshed_cal["SU.TO"]}
+    )
+    assert su_gate == 0.0 and "2 trading days" in su_reason, f"Trading-day earnings gate failed: {su_gate}, {su_reason}"
+
+    thin_pct, thin_reason = MapleStrategy.calculate_tranche_size(
+        {"Price": 38.13, "Open": 37.60, "EMA_5": 37.70, "EMA_9": 37.50, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 2.63, "Vol_SMA_10": 70810.0, "Intraday_Dollar_Vol": 667275.0, "ADX_14": 30.0, "RSI_7": 58.0}
+    )
+    assert thin_pct == 0.25 and "Thin-Liquidity" in thin_reason, f"RCH.TO thin-liquidity cap failed: {thin_pct}, {thin_reason}"
+
+    earn_cfg = {
+        "trading_mode": "LIVE",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "active_targets": {"SU.TO": {"target_price": 115.30, "stop_loss_price": 105.01}},
+        "initial_portfolio": {},
+    }
+    earn_state = {
+        "mode": "LIVE",
+        "live_verified": True,
+        "cash": 359.63,
+        "total_equity": 936.73,
+        "positions": {"SU.TO": {"shares": 1.0, "acb": 111.12, "current_price": 111.60}},  # +0.43% (< +2.0% normal trigger), 1 trading day to earnings
+    }
+    with patch.object(maple_ledger, "sync_working_orders", return_value={}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=earn_state), \
+         patch.object(maple_ledger, "load_config", return_value=earn_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_position_holding_days", return_value={"SU.TO": 1}), \
+         patch.object(maple_ledger, "execute_sell") as mock_earn_sell:
+        maple_ledger.check_target_stops({"SU.TO": 111.60}, market_data={"SU.TO": {"Price": 111.60, "trading_days_to_earnings": 1, "earnings_date": "2026-11-03"}})
+        assert mock_earn_sell.call_count == 0 and earn_cfg["active_targets"]["SU.TO"]["stop_loss_price"] == 111.12, f"Pre-earnings breakeven ratchet failed: {earn_cfg}"
+
+    with patch.object(maple_optimizer, "get_position_holding_days", return_value={"SU.TO": 0}), \
+         patch.object(maple_optimizer, "get_position_last_buy_info", return_value={"SU.TO": {"fill_acb": 110.57, "shares": 1.0}}):
+        _, earn_watch = maple_optimizer.calculate_position_attribution(
+            {"SU.TO": {"shares": 1.0, "acb": 111.12, "current_price": 111.11, "stop_loss_price": 105.01}},
+            936.73,
+            calendar_map={"SU.TO": {"earnings_date": "2026-11-03", "trading_days_to_earnings": 2}},
+        )
+        assert any(w["ticker"] == "SU.TO" and "Earnings risk in 2 trading day(s)" in w["note"] for w in earn_watch), f"Missing held earnings watchlist flag: {earn_watch}"
+
+    wk = maple_optimizer.get_weekly_summary("2026-10-30", 936.73)
+    assert wk and wk["base_date"] == "2026-10-23" and wk["wow_pnl"] == -15.94 and wk["wow_pct"] == -1.67, f"Weekly summary math mismatch: {wk}"
+
+    print("ALL 17 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

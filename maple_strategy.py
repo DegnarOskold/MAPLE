@@ -27,6 +27,8 @@ class MapleStrategy:
     CAPITULATION_MAX_TRANCHE_PCT = 0.15
     VOLUME_SINGLE_BYPASS_RATIO = 1.50
     VOLUME_BOOST_RATIO = 1.60
+    MIN_LIQUID_VOL_SMA10 = 150000.0
+    MIN_SURGE_DOLLAR_VOL_CAD = 1000000.0
     ADX_TREND_THRESHOLD = 20.0
     ADX_STRONG_THRESHOLD = 28.0
     RSI_OVERSOLD_MAX = 35.0
@@ -73,11 +75,13 @@ class MapleStrategy:
         Enforces strict entry gatekeepers for EMA_Crossover, Price vs EMA_5, and single-bypass limits.
         """
         cls._sync_from_config()
-        # 1. Earnings Risk Gatekeeper: Block buying within 3 days of an earnings report
-        days_to_earnings = stock_data.get("days_to_earnings")
+        # 1. Earnings Risk Gatekeeper: Block buying within 3 trading days of an earnings report
+        td_to_earnings = stock_data.get("trading_days_to_earnings")
+        days_to_earnings = td_to_earnings if isinstance(td_to_earnings, (int, float)) else stock_data.get("days_to_earnings")
         if isinstance(days_to_earnings, (int, float)) and 0 <= days_to_earnings <= 3:
             ed_str = stock_data.get("earnings_date", "Soon")
-            return 0.0, f"BLOCKED by Earnings Risk: Earnings call in {days_to_earnings} days ({ed_str}) - High binary gap risk"
+            unit_lbl = "trading days" if isinstance(td_to_earnings, (int, float)) else "days"
+            return 0.0, f"BLOCKED by Earnings Risk: Earnings call in {int(days_to_earnings)} {unit_lbl} ({ed_str}) - High binary gap risk"
 
         vol_ratio = stock_data.get("Vol_Ratio")
         adx = stock_data.get("ADX_14")
@@ -148,11 +152,22 @@ class MapleStrategy:
 
         score = 0
         reasons = []
+        vol_sma_10 = stock_data.get("Vol_SMA_10")
+        dollar_vol = stock_data.get("Intraday_Dollar_Vol")
+        thin_liquidity = (
+            isinstance(vol_sma_10, (int, float))
+            and vol_sma_10 < cls.MIN_LIQUID_VOL_SMA10
+            and (not isinstance(dollar_vol, (int, float)) or dollar_vol < cls.MIN_SURGE_DOLLAR_VOL_CAD)
+        )
 
         if isinstance(vol_ratio, (int, float)):
             if vol_ratio >= cls.VOLUME_BOOST_RATIO:
-                score += 2
-                reasons.append(f"Volume Surge {vol_ratio}x (+2)")
+                if thin_liquidity:
+                    score += 1
+                    reasons.append(f"Thin-Liquidity Surge {vol_ratio}x (+1)")
+                else:
+                    score += 2
+                    reasons.append(f"Volume Surge {vol_ratio}x (+2)")
             elif vol_ratio >= cls.VOLUME_CAPITULATION_RATIO:
                 score += 1
                 reasons.append(f"Above-avg Volume {vol_ratio}x (+1)")
@@ -188,10 +203,13 @@ class MapleStrategy:
         else:
             tranche_pct = cls.MIN_TRANCHE_PCT
 
-        # Cap tranche at BASE_TRANCHE_PCT (25%) if a single-bypass was used (prevents volume surge from over-sizing a weak-ADX or high-RSI entry)
+        # Cap tranche at BASE_TRANCHE_PCT (25%) if a single-bypass was used or morning liquidity is thin (<150k avg vol & <$1M traded)
         if single_bypass_used and tranche_pct > cls.BASE_TRANCHE_PCT:
             tranche_pct = cls.BASE_TRANCHE_PCT
             reasons.append("Capped at 25% by Single-Bypass Rule")
+        elif thin_liquidity and tranche_pct > cls.BASE_TRANCHE_PCT:
+            tranche_pct = cls.BASE_TRANCHE_PCT
+            reasons.append("Capped at 25% by Thin-Liquidity Floor")
 
         # Cap for scaled entries
         if "SCALED" in signal_type.upper() or "LOW-VOLUME" in signal_type.upper():
