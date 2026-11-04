@@ -120,7 +120,7 @@ def fetch_latest_market_prices(
                 for t, cid in ticker_to_cid.items():
                     q = quotes.get(cid, {})
                     # Never overwrite real-time yfinance TSX quotes with 15-min delayed IBKR snapshots ('6509': 'DB')
-                    if q.get("isDelayed", False) and t in data:
+                    if q.get("isDelayed", False) and (t in data or is_opening_chop()):
                         continue
                     last_p = q.get("lastTradePrice")
                     if last_p and isinstance(last_p, (int, float)) and last_p > 0:
@@ -128,6 +128,8 @@ def fetch_latest_market_prices(
                             data[t] = {}
                         live_px = float(last_p)
                         data[t]["Price"] = live_px
+                        if not q.get("isDelayed", False):
+                            data[t]["Stale_Intraday"] = False
                         if q.get("bidPrice") is not None:
                             data[t]["Bid"] = q.get("bidPrice")
                         if q.get("askPrice") is not None:
@@ -162,6 +164,13 @@ def fetch_latest_market_prices(
                                     data[t]["EMA_Crossover"] = "NEUTRAL (FILTERED)"
         except Exception as e:
             print(f"[MAPLE WARNING] Live IBKR quote overlay error: {e}")
+
+    if is_live and is_market_open():
+        for t in [k for k, v in data.items() if v.get("Stale_Intraday")]:
+            print(
+                f"[MAPLE STALE BAR GUARD] Skipping {t}: latest bar ({data[t].get('Bar_Date', 'prior session')}) predates today's TSX session."
+            )
+            del data[t]
 
     return data
 
@@ -338,13 +347,23 @@ def run_chop_exit_guard() -> Dict[str, Any]:
                     sym = client.search_symbol(t)
                     if sym:
                         q = client.get_quote(sym["symbolId"])
-                        if q.get("isDelayed", False) and t in price_map:
+                        if q.get("isDelayed", False) and (t in price_map or is_opening_chop()):
                             continue
                         price = q.get("lastTradePrice") or q.get("bidPrice")
                         if price and isinstance(price, (int, float)) and price > 0:
                             price_map[t] = float(price)
+                            if t in chop_mkt and not q.get("isDelayed", False):
+                                chop_mkt[t]["Stale_Intraday"] = False
         except Exception as e:
             print(f"[CHOP GUARD WARNING] Live broker quote error: {e}")
+
+    if is_live and is_market_open():
+        for t in [k for k in list(price_map.keys()) if chop_mkt.get(k, {}).get("Stale_Intraday")]:
+            print(
+                f"[MAPLE CHOP GUARD] Skipping {t}: latest bar ({chop_mkt[t].get('Bar_Date', 'prior session')}) predates today's opening cross."
+            )
+            price_map.pop(t, None)
+            chop_mkt.pop(t, None)
 
     if not price_map:
         print("[MAPLE CHOP GUARD] Quotes currently unavailable for held assets. Holding standing positions.")
@@ -430,7 +449,8 @@ def run_intraday_scan(bot_advice: str = ""):
         print(
             f"Evaluated {len(market_data)}/{len(allowed_tickers)} Shariah-compliant TSX tickers -> "
             f"{len(signals)} actionable signal(s) (Macro: GC=F={'UP' if macro_state.get('GC=F', True) else 'DOWN'}, "
-            f"CL=F={'UP' if macro_state.get('CL=F', True) else 'DOWN'})."
+            f"CL=F={'UP' if macro_state.get('CL=F', True) else 'DOWN'}, "
+            f"VIX={'PANIC' if macro_state.get('VIX_PANIC', False) else 'CALM'})."
         )
 
     if signals:
@@ -537,9 +557,11 @@ def run_intraday_scan(bot_advice: str = ""):
 
     # Dispatch Telegram interval update
     try:
-        from telegram_notifier import send_scan_update
+        import importlib
+        import telegram_notifier
+        importlib.reload(telegram_notifier)
         action_msg = f"Processed {len(signals)} trade signal(s)" if signals else "Holding & monitoring positions"
-        send_scan_update(
+        telegram_notifier.send_scan_update(
             cash=updated_state["cash"],
             total_equity=total_equity,
             positions=updated_state.get("positions", {}),

@@ -124,6 +124,10 @@ class MapleStrategy:
             if ema_cross != "BULLISH (EMA5 > EMA9)":
                 return 0.0, f"BLOCKED by Trend Gatekeeper: EMA_Crossover is '{ema_cross}' (requires confirmed 6-part BULLISH crossover)"
 
+            # Gate A2: Intraday Red-Candle Guard (never buy active afternoon breakdowns below today's open)
+            if isinstance(price, (int, float)) and isinstance(open_px, (int, float)) and open_px > 0 and price <= open_px:
+                return 0.0, f"BLOCKED by Intraday Red-Candle Guard: Live Price (${price:.2f}) <= Open (${open_px:.2f})"
+
             # Gate B: Live Price vs EMA_5 (Flaw 2 intraday rejection & Flaw 5 >3% overextension cap)
             if isinstance(price, (int, float)) and isinstance(ema_5, (int, float)) and ema_5 > 0:
                 if price < ema_5:
@@ -195,21 +199,21 @@ class MapleStrategy:
         if score >= 3:
             tranche_pct = cls.MAX_TRANCHE_PCT
         elif score == 2:
-            tranche_pct = 0.30
+            tranche_pct = min(cls.MAX_TRANCHE_PCT, round((cls.BASE_TRANCHE_PCT + cls.MAX_TRANCHE_PCT) / 2.0, 4))
         elif score in [0, 1]:
             tranche_pct = cls.BASE_TRANCHE_PCT
         elif score == -1:
-            tranche_pct = 0.20
+            tranche_pct = max(cls.MIN_TRANCHE_PCT, min(cls.BASE_TRANCHE_PCT, 0.20))
         else:
             tranche_pct = cls.MIN_TRANCHE_PCT
 
-        # Cap tranche at BASE_TRANCHE_PCT (25%) if a single-bypass was used or morning liquidity is thin (<150k avg vol & <$1M traded)
+        # Cap tranche at BASE_TRANCHE_PCT if a single-bypass was used or morning liquidity is thin (<150k avg vol & <$1M traded)
         if single_bypass_used and tranche_pct > cls.BASE_TRANCHE_PCT:
             tranche_pct = cls.BASE_TRANCHE_PCT
-            reasons.append("Capped at 25% by Single-Bypass Rule")
+            reasons.append(f"Capped at {cls.BASE_TRANCHE_PCT*100:.0f}% by Single-Bypass Rule")
         elif thin_liquidity and tranche_pct > cls.BASE_TRANCHE_PCT:
             tranche_pct = cls.BASE_TRANCHE_PCT
-            reasons.append("Capped at 25% by Thin-Liquidity Floor")
+            reasons.append(f"Capped at {cls.BASE_TRANCHE_PCT*100:.0f}% by Thin-Liquidity Floor")
 
         # Cap for scaled entries
         if "SCALED" in signal_type.upper() or "LOW-VOLUME" in signal_type.upper():

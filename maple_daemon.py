@@ -27,7 +27,7 @@ def get_seconds_until_next_interval() -> int:
     seconds = now.second
     next_quarter = ((minutes // 15) + 1) * 15
     remaining_minutes = next_quarter - minutes
-    total_seconds = (remaining_minutes * 60) - seconds
+    total_seconds = (remaining_minutes * 60) - seconds + 10
     return max(15, total_seconds)
 
 

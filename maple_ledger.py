@@ -179,6 +179,30 @@ def get_effective_order_cap(config: Dict[str, Any], total_equity: float) -> floa
     return round(max(base_cap, total_equity * max_pos_pct), 2)
 
 
+def get_effective_min_trade(config: Dict[str, Any], total_equity: float) -> float:
+    """Scales min_trade_cad dynamically with portfolio NAV (at least config floor or min_trade_pct of NAV)."""
+    base_min = float(config.get("min_trade_cad", 50.0))
+    min_pct = float(config.get("min_trade_pct", 0.05))
+    return round(max(base_min, total_equity * min_pct), 2)
+
+
+def _resolve_buy_stop(
+    config: Dict[str, Any],
+    ticker: str,
+    candidate_stop: float,
+    fill_price: float,
+    existing_shares: float,
+) -> float:
+    """Preserves any higher already-ratcheted stop_loss_price (< fill_price) when scaling into a held position."""
+    if existing_shares > 0:
+        active_targets = config.get("active_targets", {})
+        for alias in ticker_aliases(ticker):
+            existing_stop = (active_targets.get(alias) or {}).get("stop_loss_price")
+            if isinstance(existing_stop, (int, float)) and existing_stop < fill_price:
+                candidate_stop = max(candidate_stop, float(existing_stop))
+    return round(candidate_stop, 2)
+
+
 def get_effective_daily_loss_limit(config: Dict[str, Any], ref_nav: float) -> float:
     """Scales daily drawdown circuit breaker to max(daily_loss_limit_cad, daily_loss_limit_pct * ref_nav)."""
     base_lim = float(config.get("daily_loss_limit_cad", 40.0))
@@ -595,6 +619,7 @@ def execute_buy(
                 reconcile_capital_flows(cash_available, live_equity=total_equity, config=config)
             except Exception:
                 pass
+            min_trade_thresh = get_effective_min_trade(config, total_equity)
             max_single_cap = get_effective_order_cap(config, total_equity)
             if allocated_cash > max_single_cap:
                 allocated_cash = max_single_cap
@@ -712,6 +737,11 @@ def execute_buy(
             if shares <= 0:
                 print(f"[MAPLE] Price ${limit_price:.2f} exceeds allocated cash ${allocated_cash:.2f} for 1 share.")
                 return None
+            if existing_shares > 0 and shares * limit_price < min_trade_thresh:
+                print(
+                    f"[MAPLE MIN TRADE GUARD] Scale-in {shares} {ticker} @ ${limit_price:.2f} (${shares * limit_price:.2f}) below dynamic min trade ${min_trade_thresh:.2f}. Blocking fee churn."
+                )
+                return None
 
             print(f"[MAPLE LIVE ORDER] Placing Limit BUY: {shares} {ticker} @ ${limit_price:.2f} (Account #{account_id})...")
             order_res = client.place_limit_order(account_id, symbol_id, "Buy", shares, limit_price)
@@ -743,7 +773,8 @@ def execute_buy(
                 actual_px = avg_fill_price if avg_fill_price > 0 else limit_price
                 new_shares = existing_shares + shares
                 blended_acb = ((existing_shares * existing_acb) + (shares * actual_px)) / new_shares if existing_shares > 0 else actual_px
-                eff_stop = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if existing_shares > 0 else (stop_loss_price if stop_loss_price else round(actual_px * (1.0 - stop_pct / 100.0), 2))
+                base_stop = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if existing_shares > 0 else (stop_loss_price if stop_loss_price else round(actual_px * (1.0 - stop_pct / 100.0), 2))
+                eff_stop = _resolve_buy_stop(config, ticker, base_stop, actual_px, existing_shares)
 
                 bal_after = client.get_balances(account_id)
                 rem_cash = bal_after.get("cash", cash_available - (shares * actual_px))
@@ -786,6 +817,8 @@ def execute_buy(
                 print(f"[MAPLE LIVE WORKING ORDER] Limit Buy #{order_id} active on TSX book ({order_status}, fills: {cum_fill}/{shares} shs).")
                 if "pending_orders" not in config:
                     config["pending_orders"] = {}
+                est_blended = ((existing_shares * existing_acb) + (shares * limit_price)) / (existing_shares + shares) if existing_shares > 0 else limit_price
+                pending_base_stop = round(est_blended * (1.0 - stop_pct / 100.0), 2) if existing_shares > 0 else (stop_loss_price if stop_loss_price else round(limit_price * (1.0 - stop_pct / 100.0), 2))
                 config["pending_orders"][ticker] = {
                     "order_id": str(order_id),
                     "action": "BUY",
@@ -794,7 +827,7 @@ def execute_buy(
                     "acb": existing_acb,
                     "limit_price": limit_price,
                     "target_price": target_price,
-                    "stop_loss_price": stop_loss_price,
+                    "stop_loss_price": _resolve_buy_stop(config, ticker, pending_base_stop, limit_price, existing_shares),
                     "reason": notes,
                     "conid": symbol_id,
                     "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -831,6 +864,7 @@ def execute_buy(
     state = get_ledger_state()
     cash = state["cash"]
     total_equity = state.get("total_equity", cash)
+    min_trade_thresh = get_effective_min_trade(config, total_equity)
     max_single_cap = get_effective_order_cap(config, total_equity)
     if allocated_cash > max_single_cap:
         allocated_cash = max_single_cap
@@ -877,13 +911,19 @@ def execute_buy(
     )
     if shares <= 0:
         return None
+    if current_shares > 0 and shares * current_price < min_trade_thresh:
+        print(
+            f"[MAPLE MIN TRADE GUARD] Scale-in {shares} {ticker} @ ${current_price:.2f} (${shares * current_price:.2f}) below dynamic min trade ${min_trade_thresh:.2f}. Blocking fee churn."
+        )
+        return None
 
     actual_cost = round(shares * current_price, 2)
     new_cash = round(cash - actual_cost, 2)
     new_shares = current_shares + shares
     blended_acb = ((current_shares * existing_acb) + actual_cost) / new_shares if current_shares > 0 else current_price
     stop_pct = config.get("stop_loss_pct", 5.0)
-    eff_stop = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if current_shares > 0 else (stop_loss_price if stop_loss_price else round(current_price * (1.0 - stop_pct / 100.0), 2))
+    base_stop = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if current_shares > 0 else (stop_loss_price if stop_loss_price else round(current_price * (1.0 - stop_pct / 100.0), 2))
+    eff_stop = _resolve_buy_stop(config, ticker, base_stop, current_price, current_shares)
 
     log_trade(ticker, "BUY", shares, current_price, new_shares, new_cash, notes=notes)
 
@@ -1207,7 +1247,10 @@ def sync_working_orders() -> Dict[str, Any]:
                         config["active_targets"] = {}
                     stop_pct = config.get("stop_loss_pct", 5.0)
                     blended_acb = ((existing_shs * acb) + (shares * actual_px)) / new_shares if (existing_shs > 0 and new_shares > 0) else actual_px
-                    eff_stop = p_info.get("stop_loss_price") or round(blended_acb * (1.0 - stop_pct / 100.0), 2)
+                    sync_base = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if existing_shs > 0 else (p_info.get("stop_loss_price") or round(blended_acb * (1.0 - stop_pct / 100.0), 2))
+                    eff_stop = _resolve_buy_stop(config, ticker, float(sync_base), actual_px, existing_shs)
+                    if existing_shs > 0 and isinstance(p_info.get("stop_loss_price"), (int, float)) and p_info["stop_loss_price"] < actual_px:
+                        eff_stop = max(eff_stop, round(float(p_info["stop_loss_price"]), 2))
                     config["active_targets"][ticker] = {
                         "target_price": p_info.get("target_price"),
                         "stop_loss_price": eff_stop
@@ -1493,23 +1536,36 @@ def check_target_stops(
 
         if acb > 0 and price > acb:
             gain_pct = ((price - acb) / acb) * 100.0
-            if gain_pct >= MapleStrategy.BREAKEVEN_TRIGGER_PCT or (near_earnings and price >= round(acb * 1.003, 2)):
+            target_progress = ((price - acb) / (target - acb)) if (target and target > acb) else 0.0
+            if gain_pct >= MapleStrategy.BREAKEVEN_TRIGGER_PCT or target_progress >= 0.75 or (near_earnings and price >= round(acb * 1.003, 2)):
                 comm_per_order = float(config.get("commission_per_order_cad", MapleStrategy.COMMISSION_PER_ORDER_CAD))
                 # IBKR LIVE avgCost (acb) already includes entry commission; SIMULATED acb is raw fill price
                 comm_mult = 1.0 if (state.get("mode") == "LIVE" and state.get("live_verified")) else 2.0
                 comm_breakeven = round(acb + (comm_mult * comm_per_order) / max(1.0, float(shares)), 2)
                 raw_breakeven = round(acb, 2)
-                # Prefer commission-adjusted breakeven if price has at least a 0.4% cushion above it; otherwise raw ACB
+                # Tier 1: Breakeven (prefer commission-adjusted if >= 0.4% cushion; else raw ACB)
                 candidate_stop = comm_breakeven if price >= round(comm_breakeven * 1.004, 2) else raw_breakeven
+                tag = "EARNINGS BREAKEVEN RATCHET" if (near_earnings and gain_pct < MapleStrategy.BREAKEVEN_TRIGGER_PCT) else "BREAKEVEN RATCHET"
+                # Tier 2: Profit-Lock (+1.5% net above comm_breakeven once gain >= +3.0% or >= 75% to target)
+                if gain_pct >= 3.0 or target_progress >= 0.75:
+                    lock_stop = round(comm_breakeven * 1.015, 2)
+                    if price >= round(lock_stop * 1.004, 2) and lock_stop > candidate_stop:
+                        candidate_stop = lock_stop
+                        tag = "PROFIT-LOCK RATCHET (+1.5% NET)"
+                # Tier 3: High-Flyer Trail (1.25% below live price once gain >= +4.0%)
+                if gain_pct >= 4.0:
+                    trail_stop = round(price * 0.9875, 2)
+                    if trail_stop > candidate_stop:
+                        candidate_stop = trail_stop
+                        tag = "TRAILING STOP RATCHET (-1.25%)"
                 if candidate_stop < price and (stop is None or candidate_stop > stop):
                     old_stop = stop
                     stop = candidate_stop
                     config.setdefault("active_targets", {}).setdefault(matched_alias, {})["target_price"] = target
                     config["active_targets"][matched_alias]["stop_loss_price"] = stop
                     save_config(config)
-                    tag = "EARNINGS BREAKEVEN RATCHET" if (near_earnings and gain_pct < MapleStrategy.BREAKEVEN_TRIGGER_PCT) else "BREAKEVEN RATCHET"
                     print(
-                        f"[MAPLE {tag}] Ratcheted stop-loss for {ticker} from CAD {old_stop} to breakeven CAD {stop:.2f} (Price CAD {price:.2f}, +{gain_pct:.2f}%)"
+                        f"[MAPLE {tag}] Ratcheted stop-loss for {ticker} from CAD {old_stop} to CAD {stop:.2f} (Price CAD {price:.2f}, +{gain_pct:.2f}%)"
                     )
 
         # 1. Target Hit

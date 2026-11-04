@@ -251,6 +251,9 @@ def get_stock_data(
 
         latest = hist.iloc[-1]
         prev = hist.iloc[-2] if len(hist) > 1 else latest
+        now_et = _now_et()
+        bar_date = hist.index[-1].date() if hasattr(hist.index[-1], "date") else now_et.date()
+        stale_intraday = bool(_is_tsx_regular_hours(now_et) and bar_date < now_et.date())
         prev_close = float(prev["Close"])
         gap_pct = ((float(latest["Open"]) - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
         pct_from_low = ((float(latest["Close"]) - float(latest["Low"])) / float(latest["Low"])) * 100.0 if float(latest["Low"]) > 0 else 0.0
@@ -273,7 +276,6 @@ def get_stock_data(
             else:
                 vol_sma_10 = float(hist["Volume"].rolling(window=10).mean().iloc[-1])
 
-            now_et = _now_et()
             market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
             market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
             if now_et < market_open:
@@ -316,6 +318,8 @@ def get_stock_data(
             bb_upper_col = next((c for c in hist.columns if c.startswith("BBU_")), None)
 
             return {
+                "Bar_Date": bar_date.isoformat(),
+                "Stale_Intraday": stale_intraday,
                 "Prev_Close": round(prev_close, 2),
                 "Gap_Pct": round(gap_pct, 2),
                 "Pct_From_Low": round(pct_from_low, 2),
@@ -349,6 +353,8 @@ def get_stock_data(
         latest = hist.iloc[-1]
         bb_upper_col = next((c for c in hist.columns if c.startswith("BBU_")), None)
         return {
+            "Bar_Date": bar_date.isoformat(),
+            "Stale_Intraday": stale_intraday,
             "Prev_Close": round(prev_close, 2),
             "Gap_Pct": round(gap_pct, 2),
             "Pct_From_Low": round(pct_from_low, 2),
@@ -370,9 +376,9 @@ def get_stock_data(
         return None
 
 
-def get_macro_alignment() -> Dict[str, bool]:
-    """Checks intraday/daily directional alignment for Gold (GC=F) and Crude Oil (CL=F)."""
-    state = {"GC=F": True, "CL=F": True}
+def get_macro_alignment() -> Dict[str, Any]:
+    """Checks intraday/daily directional alignment for Gold (GC=F), Crude Oil (CL=F), and VIX panic regime (^VIX)."""
+    state: Dict[str, Any] = {"GC=F": True, "CL=F": True, "VIX_PANIC": False}
     for sym in ("GC=F", "CL=F"):
         try:
             hist = yf.Ticker(sym).history(period="5d", timeout=8)
@@ -380,16 +386,26 @@ def get_macro_alignment() -> Dict[str, bool]:
                 state[sym] = float(hist["Close"].iloc[-1]) >= float(hist["Close"].iloc[-2])
         except Exception:
             pass
+    try:
+        # ponytail: VIX >= 25 or +10% day spike proxy for broad-market panic; add ^GSPTSE breadth only if TSX diverges from US VIX
+        vh = yf.Ticker("^VIX").history(period="5d", timeout=8)
+        if vh is not None and len(vh) >= 2:
+            v_cur, v_prev = float(vh["Close"].iloc[-1]), float(vh["Close"].iloc[-2])
+            state["VIX_PANIC"] = v_cur >= 25.0 or (v_prev > 0 and ((v_cur - v_prev) / v_prev) >= 0.10)
+    except Exception:
+        pass
     return state
 
 
-def is_macro_aligned(ticker: str, macro_state: Optional[Dict[str, bool]] = None) -> Tuple[bool, str]:
-    """Verifies underlying commodity tailwind before buying Precious Metals or Oil & Gas stocks."""
+def is_macro_aligned(ticker: str, macro_state: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    """Verifies underlying commodity tailwind and blocks non-commodity buys during VIX panic spikes."""
     if not macro_state:
         return True, "Aligned"
     t = ticker.strip().upper()
-    if t in GOLD_LINKED_TICKERS and not macro_state.get("GC=F", True):
-        return False, "Gold futures (GC=F) negative vs prior close"
-    if t in OIL_LINKED_TICKERS and not macro_state.get("CL=F", True):
-        return False, "Crude Oil futures (CL=F) negative vs prior close"
+    if t in GOLD_LINKED_TICKERS:
+        return (True, "Aligned") if macro_state.get("GC=F", True) else (False, "Gold futures (GC=F) negative vs prior close")
+    if t in OIL_LINKED_TICKERS:
+        return (True, "Aligned") if macro_state.get("CL=F", True) else (False, "Crude Oil futures (CL=F) negative vs prior close")
+    if macro_state.get("VIX_PANIC", False):
+        return False, "Broad-market VIX panic regime (^VIX >= 25 or >= +10% spike) - non-commodity entries gated"
     return True, "Aligned"

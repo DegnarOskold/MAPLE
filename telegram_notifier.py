@@ -194,13 +194,16 @@ def send_scan_update(
         return False
 
     now_str = datetime.datetime.now().strftime("%H:%M:%S")
-    cum_return = ((total_equity - 1000.0) / 1000.0) * 100
+    from maple_ledger import get_total_invested_capital
+    inv_cap = get_total_invested_capital()
+    base_cap = inv_cap if inv_cap > 0 else 1000.0
+    cum_return = ((total_equity - base_cap) / base_cap) * 100.0
     cum_sign = "+" if cum_return >= 0 else ""
 
     lines = [
         f"<b>MAPLE Scan Update ({now_str} ET)</b>",
         f"• <b>Desk Status:</b> {action_taken}",
-        f"• <b>Portfolio NAV:</b> CAD {total_equity:.2f} ({cum_sign}{cum_return:.2f}% vs CAD 1,000 seed)",
+        f"• <b>Portfolio NAV:</b> CAD {total_equity:.2f} ({cum_sign}{cum_return:.2f}% vs CAD {base_cap:,.0f} invested)",
         f"• <b>Available Cash:</b> CAD {cash:.2f}",
     ]
 

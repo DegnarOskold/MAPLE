@@ -259,6 +259,8 @@ def run_checks():
     with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "LIVE", "account_id": "U12345678", "max_single_order_cad": 400.0, "min_trade_cad": 50.0, "max_position_pct": 0.25, "max_sector_pct": 0.35, "max_single_share_nav_pct": 0.30, "pending_orders": {}, "active_targets": {}}), \
          patch.object(maple_ledger, "save_config", side_effect=lambda c: None), \
          patch.object(maple_ledger, "get_broker_client", return_value=live_buy_broker), \
+         patch.object(maple_ledger, "_get_reference_nav", return_value=948.43), \
+         patch.object(maple_ledger, "reconcile_capital_flows", return_value=0.0), \
          patch.object(maple_ledger, "log_trade", side_effect=lambda *a, **kw: None), \
          patch.object(telegram_notifier, "send_trade_alert", return_value=True), \
          patch("time.sleep", return_value=None):
@@ -429,7 +431,7 @@ def run_checks():
     thin_pct, thin_reason = MapleStrategy.calculate_tranche_size(
         {"Price": 38.13, "Open": 37.60, "EMA_5": 37.70, "EMA_9": 37.50, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 2.63, "Vol_SMA_10": 70810.0, "Intraday_Dollar_Vol": 667275.0, "ADX_14": 30.0, "RSI_7": 58.0}
     )
-    assert thin_pct == 0.25 and "Thin-Liquidity" in thin_reason, f"RCH.TO thin-liquidity cap failed: {thin_pct}, {thin_reason}"
+    assert thin_pct == MapleStrategy.BASE_TRANCHE_PCT and "Thin-Liquidity" in thin_reason, f"RCH.TO thin-liquidity cap failed: {thin_pct}, {thin_reason}"
 
     earn_cfg = {
         "trading_mode": "LIVE",
@@ -480,13 +482,13 @@ def run_checks():
     }
     with patch.object(maple_ledger, "save_config"):
         # Stock sale alone (cash up, equity flat) must NOT be misclassified as an external deposit
-        assert maple_ledger.reconcile_capital_flows(907.93, live_equity=948.43, config=dep_cfg, today_str="2026-11-03") == 0.0
+        assert maple_ledger.reconcile_capital_flows(907.93, live_equity=948.43, config=dep_cfg, today_str="2026-11-01") == 0.0
         # Real $4,000 deposit moves BOTH cash (+$4,000) and equity (+$4,025)
-        inflow = maple_ledger.reconcile_capital_flows(4359.63, live_equity=4961.73, config=dep_cfg, today_str="2026-11-03")
-        assert inflow == 4000.0 and dep_cfg["capital_contributions"] == {"2026-11-03": 4000.0}, f"Deposit auto-detect failed: {inflow}, {dep_cfg}"
+        inflow = maple_ledger.reconcile_capital_flows(4359.63, live_equity=4961.73, config=dep_cfg, today_str="2026-11-01")
+        assert inflow == 4000.0 and dep_cfg["capital_contributions"] == {"2026-11-01": 4000.0}, f"Deposit auto-detect failed: {inflow}, {dep_cfg}"
         # Second scan on same day must NOT double-count the $4,000 deposit
-        inflow_repeat = maple_ledger.reconcile_capital_flows(4359.63, live_equity=4961.73, config=dep_cfg, today_str="2026-11-03")
-        assert inflow_repeat == 0.0 and dep_cfg["capital_contributions"] == {"2026-11-03": 4000.0}
+        inflow_repeat = maple_ledger.reconcile_capital_flows(4359.63, live_equity=4961.73, config=dep_cfg, today_str="2026-11-01")
+        assert inflow_repeat == 0.0 and dep_cfg["capital_contributions"] == {"2026-11-01": 4000.0}
 
     assert maple_ledger.get_effective_order_cap(dep_cfg, 936.73) == 400.0
     assert maple_ledger.get_effective_order_cap(dep_cfg, 4961.73) == 1240.43
@@ -501,7 +503,129 @@ def run_checks():
     wk_dep = maple_optimizer.get_weekly_summary("2026-11-06", 5010.00, config=dep_cfg)
     assert wk_dep and wk_dep["wow_pnl"] == 73.27 and wk_dep["wow_pct"] == 1.48, f"Deposit-week WoW math distorted: {wk_dep}"
 
-    print("ALL 18 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    sent_msgs = []
+    with patch.object(maple_ledger, "get_total_invested_capital", return_value=5000.0), \
+         patch.object(telegram_notifier, "load_telegram_config", return_value={"notify_on_scans": True}), \
+         patch.object(telegram_notifier, "is_configured", return_value=True), \
+         patch.object(telegram_notifier, "send_telegram_message", side_effect=lambda m: sent_msgs.append(m) or True):
+        telegram_notifier.send_scan_update(cash=2377.11, total_equity=4924.82, positions={})
+    assert sent_msgs and "-1.50% vs CAD 5,000 invested" in sent_msgs[0], f"Scan update still used $1000 seed: {sent_msgs}"
+
+    # 19. Nov 2 Geopolitical Hardening: VIX panic regime filter, event-week 15%-20% tranche cap, and tiered profit-lock / trailing ratchet
+    assert maple_market.is_macro_aligned("SHOP.TO", {"GC=F": True, "CL=F": True, "VIX_PANIC": True})[0] is False
+    assert maple_market.is_macro_aligned("CNQ.TO", {"GC=F": True, "CL=F": True, "VIX_PANIC": True})[0] is True
+    assert maple_market.is_macro_aligned("AEM.TO", {"GC=F": True, "CL=F": False, "VIX_PANIC": True})[0] is True
+
+    ew_pct, _ = MapleStrategy.calculate_tranche_size(
+        {"Price": 78.50, "Open": 77.50, "EMA_5": 77.80, "EMA_9": 77.10, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 2.0, "Vol_SMA_10": 500000.0, "Intraday_Dollar_Vol": 5000000.0, "ADX_14": 32.0, "RSI_7": 55.0}
+    )
+    assert ew_pct == 0.20, f"Event-week max tranche cap should be 0.20, got {ew_pct}"
+
+    ratch_cfg = {
+        "trading_mode": "LIVE",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "active_targets": {
+            "SU.TO": {"target_price": 115.30, "stop_loss_price": 105.01},
+            "CNQ.TO": {"target_price": 84.00, "stop_loss_price": 72.78},
+        },
+        "initial_portfolio": {},
+    }
+    ratch_state = {
+        "mode": "LIVE",
+        "live_verified": True,
+        "cash": 4359.63,
+        "total_equity": 4961.73,
+        "positions": {
+            "SU.TO": {"shares": 1.0, "acb": 111.12, "current_price": 114.60},   # +3.13% (>3.0% & >75% to 115.30) -> Tier 2 (+1.5% net above 112.12 = 113.80)
+            "CNQ.TO": {"shares": 2.0, "acb": 77.04, "current_price": 80.50},   # +4.49% (>=4.0%) -> Tier 3 (80.50 * 0.9875 = 79.49)
+        },
+    }
+    with patch.object(maple_ledger, "sync_working_orders", return_value={}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=ratch_state), \
+         patch.object(maple_ledger, "load_config", return_value=ratch_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_position_holding_days", return_value={"SU.TO": 1, "CNQ.TO": 2}), \
+         patch.object(maple_ledger, "execute_sell"):
+        maple_ledger.check_target_stops({"SU.TO": 114.60, "CNQ.TO": 80.50})
+        assert ratch_cfg["active_targets"]["SU.TO"]["stop_loss_price"] == 113.80, f"Tier 2 profit-lock failed: {ratch_cfg}"
+        assert ratch_cfg["active_targets"]["CNQ.TO"]["stop_loss_price"] == 79.49, f"Tier 3 trailing ratchet failed: {ratch_cfg}"
+
+    # 20. Nov 2 Retrospective Patches: Entry #1 red-candle block, ratcheted stop preservation on scale-in, dynamic min_trade_cad & 09:30 stale-bar guard
+    atz_pct, atz_r = MapleStrategy.calculate_tranche_size(
+        {"Price": 155.05, "Open": 156.98, "EMA_5": 154.10, "EMA_9": 152.80, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 0.92, "ADX_14": 26.0, "RSI_7": 54.0},
+        signal_type="LOW-VOLUME SCALED ENTRY",
+    )
+    assert atz_pct == 0.0 and "Intraday Red-Candle Guard" in atz_r, f"ATZ.TO afternoon breakdown not blocked: {atz_pct}, {atz_r}"
+
+    assert maple_ledger.get_effective_min_trade({"min_trade_cad": 50.0}, 1000.0) == 50.0
+    assert maple_ledger.get_effective_min_trade({"min_trade_cad": 50.0}, 4906.17) == 245.31
+
+    tfii_cfg = {
+        "trading_mode": "SIMULATED",
+        "min_trade_cad": 50.0,
+        "max_position_pct": 0.25,
+        "max_sector_pct": 0.35,
+        "scale_in_cooldown_hours": 4.0,
+        "pending_orders": {},
+        "active_targets": {"TFII.TO": {"target_price": 157.25, "stop_loss_price": 134.54}},
+    }
+    tfii_state = {
+        "mode": "SIMULATED",
+        "live_verified": False,
+        "cash": 1548.80,
+        "total_equity": 4906.17,
+        "positions": {"TFII.TO": {"shares": 4.0, "acb": 132.30, "current_price": 135.24}},
+    }
+    with patch.object(maple_ledger, "load_config", return_value=tfii_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=tfii_state), \
+         patch.object(maple_ledger, "get_position_buy_counts", return_value={"TFII.TO": 1}), \
+         patch.object(maple_ledger, "get_position_last_buy_info", return_value={"TFII.TO": {"last_buy_dt": now - datetime.timedelta(hours=5), "last_buy_price": 132.30, "shares": 4.0}}), \
+         patch.object(maple_ledger, "log_trade"):
+        # Sub-5% NAV tranche ($232.32 < $245.31) and capped 1-share scale-in ($135.24 < $245.31 when 4*135.24 + 2*135.24 ok vs 8*135.24 capped) blocked
+        assert maple_ledger.execute_buy("TFII.TO", 232.32, 135.24, open_price=133.50) is None
+        # Valid 2-share scale-in ($270.48 >= $245.31) preserves ratcheted $134.54 stop instead of wiping to $126.48
+        res_tfii = maple_ledger.execute_buy("TFII.TO", 300.00, 135.24, target_price=157.25, open_price=133.50)
+        assert res_tfii and res_tfii["shares"] == 2
+        assert tfii_cfg["active_targets"]["TFII.TO"]["stop_loss_price"] == 134.54, f"Scale-in wiped ratcheted stop: {tfii_cfg}"
+
+        # Position near 25% cap ($1,226.54) with $253.54 room (>= $245.31) -> sizes 1 share ($139.00 < $245.31) -> blocked by MIN TRADE GUARD
+        tfii_state["positions"] = {"CP.TO": {"shares": 7.0, "acb": 127.00, "current_price": 139.00}}
+    with patch.object(maple_ledger, "load_config", return_value=tfii_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=tfii_state), \
+         patch.object(maple_ledger, "get_position_buy_counts", return_value={"CP.TO": 1}), \
+         patch.object(maple_ledger, "get_position_last_buy_info", return_value={"CP.TO": {"last_buy_dt": now - datetime.timedelta(hours=5), "last_buy_price": 127.00, "shares": 7.0}}), \
+         patch.object(maple_ledger, "log_trade"):
+        assert maple_ledger.execute_buy("CP.TO", 300.00, 139.00, open_price=136.00) is None, "1-share capped scale-in (<5% NAV) was not blocked"
+
+    stale_yf = {
+        "CNQ.TO": {"Price": 78.42, "Bar_Date": "2026-10-30", "Stale_Intraday": True},
+        "SAP.TO": {"Price": 40.40, "Bar_Date": "2026-10-30", "Stale_Intraday": True},
+    }
+    stale_broker = MagicMock()
+    stale_broker.is_authenticated.return_value = True
+    stale_broker.search_symbol.side_effect = lambda t: {"symbolId": 301 if t == "CNQ.TO" else 302}
+    stale_broker.get_quotes.return_value = {
+        301: {"lastTradePrice": 78.42, "isDelayed": True},
+        302: {"lastTradePrice": 40.95, "isDelayed": False},
+    }
+    stale_broker.get_quote.side_effect = lambda cid: stale_broker.get_quotes.return_value[cid]
+    stale_chop_calls = []
+    with patch.object(maple_brain, "load_config", return_value={"trading_mode": "LIVE", "active_targets": {}}), \
+         patch.object(maple_brain, "is_market_open", return_value=True), \
+         patch.object(maple_brain, "is_opening_chop", return_value=True), \
+         patch.object(maple_brain, "get_broker_client", return_value=stale_broker), \
+         patch.object(maple_brain, "get_ledger_state", return_value={"positions": {"CNQ.TO": {"shares": 2.0, "acb": 77.04}, "SAP.TO": {"shares": 1.0, "acb": 40.09}}}), \
+         patch.object(maple_brain, "get_stock_data", side_effect=lambda t, mode="SHORT": dict(stale_yf[t])), \
+         patch.object(maple_brain, "check_target_stops", side_effect=lambda pm, **kw: stale_chop_calls.append(dict(pm))):
+        live_mkt = maple_brain.fetch_latest_market_prices(["CNQ.TO", "SAP.TO"])
+        assert "CNQ.TO" not in live_mkt and live_mkt.get("SAP.TO", {}).get("Price") == 40.95, f"Stale bar filter failed in fetch_latest_market_prices: {live_mkt}"
+        maple_brain.run_chop_exit_guard()
+        assert stale_chop_calls == [{"SAP.TO": 40.95}], f"Stale bar filter failed in run_chop_exit_guard: {stale_chop_calls}"
+
+    print("ALL 20 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

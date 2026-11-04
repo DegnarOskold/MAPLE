@@ -110,7 +110,9 @@ def generate_comparison_report() -> str:
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     maple_raw_cfg = load_config()
     maple_baseline = get_total_invested_capital(maple_raw_cfg)
-    maple_return = compute_twr_pct(maple_nav["nav"], config=maple_raw_cfg)
+    maple_return = round(((maple_nav["nav"] - maple_baseline) / maple_baseline) * 100.0, 2) if maple_baseline > 0 else 0.0
+    maple_twr = compute_twr_pct(maple_nav["nav"], config=maple_raw_cfg)
+    target_90d = round(maple_baseline * 1.12, 2)
     bench_date, tsx_return = _get_tsx60_benchmark_return()
 
     report = []
@@ -118,7 +120,7 @@ def generate_comparison_report() -> str:
     report.append("|  MAPLE vs S&P/TSX 60 (XIU.TO) -- PERFORMANCE BENCHMARK           |")
     report.append(f"|  Mode: {maple_raw.get('mode', 'SIMULATED'):<8} | Account: #{maple_raw.get('account_id', 'SIM'):<12} | Time: {now_str[:16]}  |")
     report.append("+------------------------------------------------------------------+")
-    report.append(f"|  MAPLE Portfolio NAV:            ${maple_nav['nav']:<10.2f} ({maple_return:+.2f}%)               |")
+    report.append(f"|  MAPLE Portfolio NAV:            ${maple_nav['nav']:<10.2f} ({maple_return:+.2f}% vs ${maple_baseline:,.0f} / TWR {maple_twr:+.2f}%) |")
     report.append(f"|  MAPLE Available Cash:           ${maple_nav['cash']:<10.2f}                      |")
     report.append(f"|  S&P/TSX 60 (since {bench_date}):   {tsx_return:+.2f}%                          |")
     report.append("+------------------------------------------------------------------+")
@@ -130,7 +132,7 @@ def generate_comparison_report() -> str:
             pos_line = f"|    * {t}: {d['shares']:.1f} shs @ ${d['price']:.2f} (P&L: ${d['pnl']:+.2f} / {d['pnl_pct']:+.2f}%)"
             report.append(f"{pos_line:<67}|")
     report.append("+------------------------------------------------------------------+")
-    report.append("|  Target Benchmark: +12.00% per 90 Days ($1,120.00 Target)        |")
+    report.append(f"|  Target Benchmark: +12.00% per 90 Days (${target_90d:,.2f} Target)       |")
     status_str = "ON TRACK (+12% GOAL)" if maple_return >= 0 else "DEFENSIVE / CAPITAL PRESERVATION"
     report.append(f"|  MAPLE 90-Day Trajectory:        {status_str:<32}|")
     report.append("+==================================================================+")
