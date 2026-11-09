@@ -24,6 +24,7 @@ class MapleStrategy:
     # Thresholds
     VOLUME_CAPITULATION_RATIO = 1.25
     CAPITULATION_MIN_BOUNCE_PCT = 1.50
+    CAPITULATION_MAX_BOUNCE_PCT = 4.50
     CAPITULATION_MAX_TRANCHE_PCT = 0.15
     VOLUME_SINGLE_BYPASS_RATIO = 1.50
     VOLUME_BOOST_RATIO = 1.60
@@ -40,7 +41,8 @@ class MapleStrategy:
 
     # Stop Loss & Profit Target Heuristics
     STOP_LOSS_PCT = 5.0
-    BREAKEVEN_TRIGGER_PCT = 2.0
+    HALF_RISK_TRIGGER_PCT = 2.0
+    BREAKEVEN_TRIGGER_PCT = 2.5
     ATR_TARGET_MULTIPLIER = 1.5
     STAGNATION_DAYS = 4
     COMMISSION_PER_ORDER_CAD = 1.00
@@ -58,10 +60,13 @@ class MapleStrategy:
             cls.MAX_TRANCHE_PCT = float(sp.get("max_tranche_pct", cls.MAX_TRANCHE_PCT))
             cls.VOLUME_CAPITULATION_RATIO = float(sp.get("volume_capitulation_ratio", cls.VOLUME_CAPITULATION_RATIO))
             cls.CAPITULATION_MIN_BOUNCE_PCT = float(sp.get("capitulation_min_bounce_pct", cls.CAPITULATION_MIN_BOUNCE_PCT))
+            cls.CAPITULATION_MAX_BOUNCE_PCT = float(sp.get("capitulation_max_bounce_pct", cls.CAPITULATION_MAX_BOUNCE_PCT))
             cls.CAPITULATION_MAX_TRANCHE_PCT = float(sp.get("capitulation_max_tranche_pct", cls.CAPITULATION_MAX_TRANCHE_PCT))
             cls.VOLUME_BOOST_RATIO = float(sp.get("volume_boost_threshold", cls.VOLUME_BOOST_RATIO))
             cls.ADX_STRONG_THRESHOLD = float(sp.get("adx_strong_trend", cls.ADX_STRONG_THRESHOLD))
             cls.STOP_LOSS_PCT = float(cfg.get("stop_loss_pct", cls.STOP_LOSS_PCT))
+            cls.HALF_RISK_TRIGGER_PCT = float(cfg.get("half_risk_trigger_pct", cls.HALF_RISK_TRIGGER_PCT))
+            cls.BREAKEVEN_TRIGGER_PCT = float(cfg.get("breakeven_trigger_pct", cls.BREAKEVEN_TRIGGER_PCT))
             cls.COMMISSION_PER_ORDER_CAD = float(cfg.get("commission_per_order_cad", cls.COMMISSION_PER_ORDER_CAD))
             cls.MIN_NET_PROFIT_PCT = float(cfg.get("min_net_profit_pct", cls.MIN_NET_PROFIT_PCT))
         except Exception:
@@ -111,6 +116,8 @@ class MapleStrategy:
                 return 0.0, f"BLOCKED by Capitulation Knife-Catch Guard: Red/flat intraday candle (Price ${price} <= Open ${open_px})"
             if not (isinstance(pct_from_low, (int, float)) and pct_from_low >= cls.CAPITULATION_MIN_BOUNCE_PCT):
                 return 0.0, f"BLOCKED by Capitulation Bounce Filter: Rebound off low ({pct_from_low}%) < {cls.CAPITULATION_MIN_BOUNCE_PCT:.2f}% minimum"
+            if pct_from_low > cls.CAPITULATION_MAX_BOUNCE_PCT:
+                return 0.0, f"BLOCKED by Capitulation Overextension Filter: Rebound off low ({pct_from_low}%) > {cls.CAPITULATION_MAX_BOUNCE_PCT:.2f}% ceiling"
             cap_pct = round(min(cls.MIN_TRANCHE_PCT, cls.CAPITULATION_MAX_TRANCHE_PCT), 4)
             return cap_pct, (
                 f"Capitulation Reversal Starter (RSI {rsi}, Vol {vol_ratio}x, "

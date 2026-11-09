@@ -500,10 +500,11 @@ def run_intraday_scan(bot_advice: str = ""):
 
                 curr_state = get_ledger_state()
                 curr_cash = curr_state["cash"]
+                curr_nav = float(curr_state.get("total_equity") or curr_cash)
                 existing_pos = curr_state.get("positions", {}).get(ticker, {})
                 existing_shs = float(existing_pos.get("shares", 0.0))
                 existing_acb = float(existing_pos.get("acb", current_price))
-                allocated = round(curr_cash * tranche_pct, 2)
+                allocated = round(min(curr_cash, curr_nav * tranche_pct), 2)
                 raw_shs = allocated / current_price
                 estimated_shares = int(raw_shs) + (1 if int(raw_shs) >= 1 and (raw_shs - int(raw_shs)) >= 0.5 and (int(raw_shs) + 1) * current_price <= allocated * 1.15 else 0)
                 estimated_shares = max(1, estimated_shares)

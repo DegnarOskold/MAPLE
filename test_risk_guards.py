@@ -585,10 +585,10 @@ def run_checks():
          patch.object(maple_ledger, "log_trade"):
         # Sub-5% NAV tranche ($232.32 < $245.31) and capped 1-share scale-in ($135.24 < $245.31 when 4*135.24 + 2*135.24 ok vs 8*135.24 capped) blocked
         assert maple_ledger.execute_buy("TFII.TO", 232.32, 135.24, open_price=133.50) is None
-        # Valid 2-share scale-in ($270.48 >= $245.31) preserves ratcheted $134.54 stop instead of wiping to $126.48
+        # Valid 2-share scale-in ($270.48 >= $245.31) preserves ratcheted stop capped at -2.5% below new $133.28 blended ACB ($129.95 vs -5% $126.62)
         res_tfii = maple_ledger.execute_buy("TFII.TO", 300.00, 135.24, target_price=157.25, open_price=133.50)
         assert res_tfii and res_tfii["shares"] == 2
-        assert tfii_cfg["active_targets"]["TFII.TO"]["stop_loss_price"] == 134.54, f"Scale-in wiped ratcheted stop: {tfii_cfg}"
+        assert tfii_cfg["active_targets"]["TFII.TO"]["stop_loss_price"] == 129.95, f"Scale-in half-risk stop cap mismatch: {tfii_cfg}"
 
         # Position near 25% cap ($1,226.54) with $253.54 room (>= $245.31) -> sizes 1 share ($139.00 < $245.31) -> blocked by MIN TRADE GUARD
         tfii_state["positions"] = {"CP.TO": {"shares": 7.0, "acb": 127.00, "current_price": 139.00}}
@@ -625,7 +625,50 @@ def run_checks():
         maple_brain.run_chop_exit_guard()
         assert stale_chop_calls == [{"SAP.TO": 40.95}], f"Stale bar filter failed in run_chop_exit_guard: {stale_chop_calls}"
 
-    print("ALL 20 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 21. Nov 9 Weekly Retrospective Patches: Tier 0.5 Half-Risk Ratchet (+2.0% -> -2.5%), +2.5% Breakeven Trigger,
+    #     Post-Stop/Stagnation 4h Re-Entry Cooldown, Capitulation +4.50% Overextension Ceiling, and NAV-Anchored Tranche Sizing
+    over_cap, r_over = MapleStrategy.calculate_tranche_size(
+        {"RSI_7": 29.9, "Vol_Ratio": 1.83, "Open": 180.00, "Price": 185.00, "Pct_From_Low": 4.92, "EMA_Crossover": "BEARISH (EMA5 < EMA9)"},
+        signal_type="CAPITULATION REVERSAL",
+    )
+    assert over_cap == 0.0 and "Overextension Filter" in r_over, f"Over-bounced SHOP.TO capitulation not blocked: {over_cap}, {r_over}"
+
+    tier_cfg = {
+        "trading_mode": "LIVE",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "active_targets": {
+            "CCO.TO": {"target_price": 111.47, "stop_loss_price": 93.99},
+            "WCN.TO": {"target_price": 274.77, "stop_loss_price": 250.77},
+        },
+        "initial_portfolio": {},
+    }
+    tier_state = {
+        "mode": "LIVE",
+        "live_verified": True,
+        "cash": 1853.20,
+        "total_equity": 4993.96,
+        "positions": {
+            "CCO.TO": {"shares": 5.0, "acb": 98.96, "current_price": 101.00},   # +2.06% (>=2.0%, <2.5%) -> Tier 0.5 Half-Risk (98.96 * 0.975 = 96.49)
+            "WCN.TO": {"shares": 2.0, "acb": 264.47, "current_price": 271.50},  # +2.66% (>=2.5%, <3.0%) -> Tier 1 Breakeven (264.47 + 0.50 = 264.97)
+        },
+    }
+    with patch.object(maple_ledger, "sync_working_orders", return_value={}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=tier_state), \
+         patch.object(maple_ledger, "load_config", return_value=tier_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_position_holding_days", return_value={"CCO.TO": 1, "WCN.TO": 1}), \
+         patch.object(maple_ledger, "execute_sell"):
+        maple_ledger.check_target_stops({"CCO.TO": 101.00, "WCN.TO": 271.50})
+        assert tier_cfg["active_targets"]["CCO.TO"]["stop_loss_price"] == 96.49, f"Tier 0.5 half-risk ratchet failed: {tier_cfg}"
+        assert tier_cfg["active_targets"]["WCN.TO"]["stop_loss_price"] == 264.97, f"Tier 1 +2.5% breakeven ratchet failed: {tier_cfg}"
+
+    with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "scale_in_cooldown_hours": 4.0, "pending_orders": {}}), \
+         patch.object(maple_ledger, "get_position_buy_counts", return_value={}), \
+         patch.object(maple_ledger, "get_last_loss_exit_info", return_value={"TFII.TO": {"last_exit_dt": now - datetime.timedelta(minutes=45), "last_exit_price": 132.84, "notes": "AUTO STOP-LOSS"}}):
+        assert maple_ledger.execute_buy("TFII.TO", 750.0, 135.46, open_price=133.00) is None, "45-min post-stop re-entry was not blocked"
+
+    print("ALL 21 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
