@@ -1618,6 +1618,8 @@ def check_target_stops(
                 if candidate_stop < price and (stop is None or candidate_stop > stop):
                     old_stop = stop
                     stop = candidate_stop
+                    config = load_config()
+                    active_targets = config.get("active_targets", {})
                     config.setdefault("active_targets", {}).setdefault(matched_alias, {})["target_price"] = target
                     config["active_targets"][matched_alias]["stop_loss_price"] = stop
                     save_config(config)
@@ -1632,6 +1634,8 @@ def check_target_stops(
                 price,
                 reason=f"AUTO TARGET HIT: CAD {price:.2f} (Target CAD {target:.2f})",
             )
+            config = load_config()
+            active_targets = config.get("active_targets", {})
             continue
 
         # 2. Stop-Loss Hit (buffered during 9:30-10:00 AM opening chop to prevent opening-wick shakeouts)
@@ -1645,6 +1649,8 @@ def check_target_stops(
                     price,
                     reason=f"AUTO STOP-LOSS HIT: CAD {price:.2f} ({stop_label})",
                 )
+                config = load_config()
+                active_targets = config.get("active_targets", {})
                 continue
             elif is_chop_window and price <= stop:
                 print(
@@ -1701,6 +1707,8 @@ def check_target_stops(
                             price,
                             reason=f"AUTO STAGNATION EXIT: Held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d) at {pnl_pct:+.2f}% with {tech_reason}",
                         )
+                        config = load_config()
+                        active_targets = config.get("active_targets", {})
                         continue
 
 

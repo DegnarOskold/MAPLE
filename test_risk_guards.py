@@ -668,7 +668,46 @@ def run_checks():
          patch.object(maple_ledger, "get_last_loss_exit_info", return_value={"TFII.TO": {"last_exit_dt": now - datetime.timedelta(minutes=45), "last_exit_price": 132.84, "notes": "AUTO STOP-LOSS"}}):
         assert maple_ledger.execute_buy("TFII.TO", 750.0, 135.46, open_price=133.00) is None, "45-min post-stop re-entry was not blocked"
 
-    print("ALL 21 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 22. Nov 10 Fix: Stale config overwrite guard in check_target_stops when execute_sell + ratchet occur in same pass
+    disk_cfg = {
+        "trading_mode": "LIVE",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "active_targets": {
+            "TFII.TO": {"target_price": 154.56, "stop_loss_price": 130.05},
+            "CCO.TO": {"target_price": 111.47, "stop_loss_price": 102.92},
+        },
+        "initial_portfolio": {},
+    }
+    def _mock_sell_mutates_disk(tk, px, reason=""):
+        disk_cfg["active_targets"].pop(tk, None)
+        disk_cfg["pending_orders"]["WORKING_TEST"] = {"order_id": "999"}
+
+    with patch.object(maple_ledger, "sync_working_orders", return_value={}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value={
+             "mode": "LIVE",
+             "live_verified": True,
+             "cash": 1133.72,
+             "total_equity": 5041.39,
+             "positions": {
+                 "TFII.TO": {"shares": 4.0, "acb": 137.14, "current_price": 129.90},
+                 "CCO.TO": {"shares": 8.0, "acb": 99.69, "current_price": 104.38},
+             },
+         }), \
+         patch.object(maple_ledger, "load_config", side_effect=lambda: {
+             **disk_cfg,
+             "active_targets": {k: dict(v) for k, v in disk_cfg["active_targets"].items()},
+             "pending_orders": {k: dict(v) for k, v in disk_cfg["pending_orders"].items()},
+         }), \
+         patch.object(maple_ledger, "save_config", side_effect=lambda c: disk_cfg.update(c)), \
+         patch.object(maple_ledger, "get_position_holding_days", return_value={"TFII.TO": 5, "CCO.TO": 1}), \
+         patch.object(maple_ledger, "execute_sell", side_effect=_mock_sell_mutates_disk):
+        maple_ledger.check_target_stops({"TFII.TO": 129.90, "CCO.TO": 104.38})
+        assert "TFII.TO" not in disk_cfg["active_targets"], f"Stale config resurrected sold TFII.TO: {disk_cfg}"
+        assert disk_cfg["active_targets"]["CCO.TO"]["stop_loss_price"] == 103.08, f"CCO.TO ratchet missing: {disk_cfg}"
+        assert "WORKING_TEST" in disk_cfg["pending_orders"], f"Stale config wiped pending_orders: {disk_cfg}"
+
+    print("ALL 22 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
