@@ -14,6 +14,7 @@ maple_trades.csv
 maple_daily_nav.json
 maple_advice_history.txt
 maple_trades_*.csv
+maple_logic_changelog.md
 
 # Runtime Caches & Local Locks
 *_cache.json
