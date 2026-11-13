@@ -385,17 +385,20 @@ def send_retrospective_report(
     else:
         lines.append("\n<b>4. Risk Watchlist:</b> All positions maintain >3.0% buffer above stop-loss thresholds.")
 
-    # 5. Missed Opportunities / Screened Universe Movers
+    # 5. Missed Opportunities / Filtered Non-Held Movers
     if missed_opportunities:
-        lines.append("\n<b>5. Screened Universe Tape (Non-Held Top Movers):</b>")
-        top_movers = sorted(missed_opportunities, key=lambda x: x.get("day_gain", 0), reverse=True)[:3]
-        for m in top_movers:
-            ticker = m.get("ticker")
-            gain = m.get("day_gain", 0)
-            rsi = m.get("rsi", "N/A")
-            vol = m.get("vol_ratio", "N/A")
-            gate = f" — <i>{html.escape(str(m['gate_status']))}</i>" if m.get("gate_status") else ""
-            lines.append(f"• <code>{ticker}</code>: +{gain:.1f}% (RSI: {rsi} | Vol: {vol}x){gate}")
+        actionable_m = [m for m in missed_opportunities if m.get("eligible")]
+        filtered_m = [m for m in missed_opportunities if not m.get("eligible")]
+        if actionable_m:
+            lines.append("\n<b>5a. Missed Actionable Setups:</b>")
+            for m in sorted(actionable_m, key=lambda x: x.get("day_gain", 0), reverse=True)[:3]:
+                gate = f" — <i>{html.escape(str(m['gate_status']))}</i>" if m.get("gate_status") else ""
+                lines.append(f"• <code>{m.get('ticker')}</code>: +{m.get('day_gain', 0):.1f}% (RSI: {m.get('rsi', 'N/A')} | Vol: {m.get('vol_ratio', 'N/A')}x){gate}")
+        if filtered_m:
+            lines.append("\n<b>5b. Filtered Non-Held Movers (Blocked as Designed):</b>")
+            for m in sorted(filtered_m, key=lambda x: x.get("day_gain", 0), reverse=True)[:3]:
+                gate = f" — <i>{html.escape(str(m['gate_status']))}</i>" if m.get("gate_status") else ""
+                lines.append(f"• <code>{m.get('ticker')}</code>: +{m.get('day_gain', 0):.1f}% (RSI: {m.get('rsi', 'N/A')} | Vol: {m.get('vol_ratio', 'N/A')}x){gate}")
 
     # 6. Strategy & System Adjustments
     lines.append("\n<b>6. Strategy & System Status:</b>")

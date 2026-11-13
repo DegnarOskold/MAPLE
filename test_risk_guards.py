@@ -707,7 +707,29 @@ def run_checks():
         assert disk_cfg["active_targets"]["CCO.TO"]["stop_loss_price"] == 103.08, f"CCO.TO ratchet missing: {disk_cfg}"
         assert "WORKING_TEST" in disk_cfg["pending_orders"], f"Stale config wiped pending_orders: {disk_cfg}"
 
-    print("ALL 22 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 23. Nov 13 Fixes: Low-volume 1.00x floor & 15% cap, total-CAD fee attribution, Day-3 stagnation warning & near-cap/liquidity alerts
+    lv_block, lv_reason = MapleStrategy.calculate_tranche_size(
+        {"Price": 116.50, "Open": 115.80, "EMA_5": 116.00, "EMA_9": 115.20, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 0.90, "ADX_14": 40.0, "RSI_7": 58.0},
+        signal_type="LOW-VOLUME SCALED ENTRY",
+    )
+    assert lv_block == 0.0 and "Low Volume" in lv_reason, f"Sub-1.00x low-volume entry not blocked: {lv_block}, {lv_reason}"
+
+    lv_cap, lv_cap_r = MapleStrategy.calculate_tranche_size(
+        {"Price": 116.50, "Open": 115.80, "EMA_5": 116.00, "EMA_9": 115.20, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.05, "ADX_14": 40.0, "RSI_7": 58.0},
+        signal_type="LOW-VOLUME SCALED ENTRY",
+    )
+    assert lv_cap == MapleStrategy.MIN_TRANCHE_PCT and "Capped at 15%" in lv_cap_r, f"Scaled entry exceeded 15% floor: {lv_cap}, {lv_cap_r}"
+
+    with patch.object(maple_optimizer, "get_position_holding_days", return_value={"ENGH.TO": 3}), \
+         patch.object(maple_optimizer, "get_position_last_buy_info", return_value={"ENGH.TO": {"fill_acb": 18.60, "shares": 41.0}}):
+        engh_attr, engh_watch = maple_optimizer.calculate_position_attribution(
+            {"ENGH.TO": {"shares": 41.0, "acb": 18.62439025, "current_price": 18.15}},
+            5028.58,
+        )
+        assert engh_attr[0]["entry_fee_cad"] == 1.00, f"High-share entry fee hidden: {engh_attr}"
+        assert engh_watch and "Approaching Day-4 stagnation check tomorrow" in engh_watch[0]["note"], f"Day-3 early stagnation warning missing: {engh_watch}"
+
+    print("ALL 23 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ class MapleStrategy:
     CAPITULATION_MIN_BOUNCE_PCT = 1.50
     CAPITULATION_MAX_BOUNCE_PCT = 4.50
     CAPITULATION_MAX_TRANCHE_PCT = 0.15
+    MIN_SCALED_VOL_RATIO = 1.00
     VOLUME_SINGLE_BYPASS_RATIO = 1.50
     VOLUME_BOOST_RATIO = 1.60
     MIN_LIQUID_VOL_SMA10 = 150000.0
@@ -62,6 +63,7 @@ class MapleStrategy:
             cls.CAPITULATION_MIN_BOUNCE_PCT = float(sp.get("capitulation_min_bounce_pct", cls.CAPITULATION_MIN_BOUNCE_PCT))
             cls.CAPITULATION_MAX_BOUNCE_PCT = float(sp.get("capitulation_max_bounce_pct", cls.CAPITULATION_MAX_BOUNCE_PCT))
             cls.CAPITULATION_MAX_TRANCHE_PCT = float(sp.get("capitulation_max_tranche_pct", cls.CAPITULATION_MAX_TRANCHE_PCT))
+            cls.MIN_SCALED_VOL_RATIO = float(sp.get("min_scaled_vol_ratio", cls.MIN_SCALED_VOL_RATIO))
             cls.VOLUME_BOOST_RATIO = float(sp.get("volume_boost_threshold", cls.VOLUME_BOOST_RATIO))
             cls.ADX_STRONG_THRESHOLD = float(sp.get("adx_strong_trend", cls.ADX_STRONG_THRESHOLD))
             cls.STOP_LOSS_PCT = float(cfg.get("stop_loss_pct", cls.STOP_LOSS_PCT))
@@ -147,8 +149,8 @@ class MapleStrategy:
             if isinstance(rsi, (int, float)) and rsi > cls.RSI_OVERBOUGHT_LIMIT:
                 return 0.0, f"BLOCKED by Overbought Ceiling (Flaw 4/5): RSI_7 ({rsi}) exceeds hard ceiling ({cls.RSI_OVERBOUGHT_LIMIT})"
 
-            if isinstance(vol_ratio, (int, float)) and vol_ratio < 0.80:
-                return 0.0, f"BLOCKED by Low Volume: Vol_Ratio ({vol_ratio}x) below 0.80x minimum threshold"
+            if isinstance(vol_ratio, (int, float)) and vol_ratio < cls.MIN_SCALED_VOL_RATIO:
+                return 0.0, f"BLOCKED by Low Volume: Vol_Ratio ({vol_ratio}x) below {cls.MIN_SCALED_VOL_RATIO:.2f}x minimum threshold"
 
             adx_ok = isinstance(adx, (int, float)) and adx >= cls.ADX_TREND_THRESHOLD
             rsi_std_ok = isinstance(rsi, (int, float)) and rsi <= cls.RSI_STANDARD_MAX
@@ -222,10 +224,10 @@ class MapleStrategy:
             tranche_pct = cls.BASE_TRANCHE_PCT
             reasons.append(f"Capped at {cls.BASE_TRANCHE_PCT*100:.0f}% by Thin-Liquidity Floor")
 
-        # Cap for scaled entries
+        # Cap for low-volume / scaled entries strictly at starter minimum tranche
         if "SCALED" in signal_type.upper() or "LOW-VOLUME" in signal_type.upper():
-            tranche_pct = min(tranche_pct, 0.20)
-            reasons.append("Capped by Scaled Entry Rule")
+            tranche_pct = min(tranche_pct, cls.MIN_TRANCHE_PCT)
+            reasons.append(f"Capped at {cls.MIN_TRANCHE_PCT*100:.0f}% by Scaled Entry Rule")
 
         reason_str = ", ".join(reasons) if reasons else "Neutral baseline"
         return round(tranche_pct, 4), reason_str

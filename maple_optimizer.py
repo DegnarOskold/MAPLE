@@ -9,9 +9,9 @@ Objectives:
    - Position-by-position performance and drawdown attribution (identifies primary detractors and winners).
    - Risk audit on losing positions (distance to stop loss, volatility, position concentration).
 2. Retrospective analysis of screened 32-asset universe:
-   - Missed opportunities (stocks that broke out without triggering a buy).
-3. Strategy parameter tuning within defined limits:
-   - Tunes volume capitulation, tranche sizing, and ATR target multiples when warranted by tape data.
+   - Distinguishes actionable missed setups from intentionally gated/rejected bounces.
+3. Quantitative risk & liquidity oversight:
+   - Surfaces near-cap sector clustering, low deployable cash, and impending Day-4 stagnation exits.
 4. Comprehensive audit logging to maple_logic_changelog.md and Telegram performance reporting.
 """
 
@@ -32,6 +32,7 @@ from maple_ledger import (
     load_config,
     save_config,
     get_ledger_state,
+    get_effective_min_trade,
     get_net_contributions,
     get_total_invested_capital,
     compute_twr_pct,
@@ -246,7 +247,8 @@ def calculate_position_attribution(
         acb = float(p.get("acb", cur_p))
         b_info = buy_info_map.get(normalize_ticker(sym), {})
         fill_px = float(b_info.get("fill_acb") or acb)
-        fee_drag = round((acb - fill_px) * shs, 2) if (acb - fill_px) >= 0.05 else 0.0
+        raw_fee_drag = round((acb - fill_px) * shs, 2)
+        fee_drag = raw_fee_drag if raw_fee_drag >= 0.50 else 0.0
         gross_pnl = round((cur_p - fill_px) * shs, 2) if fee_drag > 0 else round((cur_p - acb) * shs, 2)
         tot_cost = acb * shs
         mkt_val = cur_p * shs
@@ -295,6 +297,8 @@ def calculate_position_attribution(
             notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
         if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
             notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
+        elif days_held == MapleStrategy.STAGNATION_DAYS - 1 and unrealized < 0:
+            notes.append(f"Approaching Day-{MapleStrategy.STAGNATION_DAYS} stagnation check tomorrow ({days_held}d held)")
 
         cal_info = (calendar_map or {}).get(normalize_ticker(sym), {})
         earn_td = cal_info.get("trading_days_to_earnings")
@@ -380,7 +384,8 @@ def run_daily_self_assessment():
     equity = float(state.get("total_equity", cash))
     positions = state.get("positions", {})
 
-    # Refresh held position marks with real-time TSX closing prices and compute 32-ticker equal-weight benchmark
+    # Compute 32-ticker equal-weight benchmark; preserve authoritative live broker marks when verified
+    live_authoritative = is_live and bool(state.get("live_verified", False)) and equity > 0
     norm_allowed = [normalize_ticker(t) for t in allowed_tickers]
     prefetched = prefetch_histories(norm_allowed) if len(norm_allowed) > 1 else {}
     basket_gains: List[float] = []
@@ -393,7 +398,8 @@ def run_daily_self_assessment():
             )
             if sd and isinstance(sd.get("Price"), (int, float)) and sd["Price"] > 0:
                 if sym in positions and positions[sym].get("shares", 0) > 0:
-                    positions[sym]["current_price"] = float(sd["Price"])
+                    if not live_authoritative or not positions[sym].get("current_price"):
+                        positions[sym]["current_price"] = float(sd["Price"])
                 prev_c = sd.get("Prev_Close")
                 if isinstance(prev_c, (int, float)) and prev_c > 0:
                     basket_gains.append(((float(sd["Price"]) - float(prev_c)) / float(prev_c)) * 100.0)
@@ -405,11 +411,14 @@ def run_daily_self_assessment():
             try:
                 sd = get_stock_data(sym, mode="SHORT")
                 if sd and isinstance(sd.get("Price"), (int, float)) and sd["Price"] > 0:
-                    p["current_price"] = float(sd["Price"])
-                    refreshed_any = True
+                    if not live_authoritative or not p.get("current_price"):
+                        p["current_price"] = float(sd["Price"])
+                        refreshed_any = True
             except Exception:
                 pass
-    if refreshed_any or any(sym in norm_allowed and p.get("shares", 0) > 0 for sym, p in positions.items()):
+    if not live_authoritative and (
+        refreshed_any or any(sym in norm_allowed and p.get("shares", 0) > 0 for sym, p in positions.items())
+    ):
         equity = round(
             cash + sum(float(p["shares"]) * float(p.get("current_price", p.get("acb", 0))) for p in positions.values() if p.get("shares", 0) > 0),
             2,
@@ -478,6 +487,17 @@ def run_daily_self_assessment():
             audit_flags.append(
                 f"[RISK ALERT] {sec} sector concentration at {sec_pct:.1f}% of NAV (cap {max_sector_pct:.0f}%); new {sec} entries gated."
             )
+        elif sec_pct >= max_sector_pct - 5.0:
+            audit_flags.append(
+                f"[RISK WATCH] {sec} sector concentration near cap at {sec_pct:.1f}% of NAV (cap {max_sector_pct:.0f}%)."
+            )
+
+    eff_min_trade = get_effective_min_trade(config, equity)
+    low_cash_floor = max(eff_min_trade, equity * 0.10) if equity > 0 else eff_min_trade
+    if equity > 0 and cash < low_cash_floor:
+        audit_flags.append(
+            f"[LIQUIDITY WATCH] Deployable cash at CAD {cash:.2f} ({cash/equity*100:.1f}% of NAV; below CAD {low_cash_floor:.2f} 10% / min-trade buffer)."
+        )
 
     if daily_pct <= -1.5:
         worst_str = f" (primary open detractor: {attribution[0]['ticker']} CAD {attribution[0]['unrealized_pnl']:+.2f})" if attribution else ""
@@ -490,10 +510,16 @@ def run_daily_self_assessment():
         )
 
     MapleStrategy._sync_from_config()
-    if missed:
-        print(f"Identified {len(missed)} non-held top basket movers today:")
-        for m in missed:
+    actionable_missed = [m for m in missed if m.get("eligible")]
+    filtered_movers = [m for m in missed if not m.get("eligible")]
+    if actionable_missed:
+        print(f"Identified {len(actionable_missed)} actionable missed setup(s) today:")
+        for m in actionable_missed:
             print(f"  * {m['ticker']}: +{m['day_gain']}% today, +{m['pct_from_low']}% from low (RSI: {m['rsi']}, Vol: {m['vol_ratio']}x | {m.get('gate_status', '')})")
+    if filtered_movers:
+        print(f"Identified {len(filtered_movers)} filtered non-held mover(s) blocked by rules:")
+        for m in filtered_movers:
+            print(f"  * {m['ticker']}: +{m['day_gain']}% today, +{m['pct_from_low']}% from low (RSI: {m['rsi']}, Vol: {m['vol_ratio']}x | Skipped: {m.get('gate_status', '')})")
 
     # 5. Build Comprehensive Quantitative Changelog Entry
     is_friday = datetime.date.fromisoformat(today_str).weekday() == 4
@@ -566,10 +592,15 @@ def run_daily_self_assessment():
         for rw in risk_watchlist:
             report.append(f"- ⚠️ **{rw['ticker']}**: {rw['note']} (Current: CAD {rw['current_price']:.2f}, Stop: CAD {rw['stop_price']:.2f}, Buffer: CAD {rw['distance_to_stop_cad']:.2f} / {rw['distance_to_stop_pct']:.1f}%)")
 
-    if missed:
-        report.append(f"\n**Screened Universe Top Movers ({len(missed)} non-held candidates):**")
-        for m in sorted(missed, key=lambda x: x.get("day_gain", 0), reverse=True)[:4]:
-            gate_tag = f" | Gate: `{m['gate_status']}`" if m.get("gate_status") else ""
+    if actionable_missed:
+        report.append(f"\n**Missed Actionable Setups ({len(actionable_missed)}):**")
+        for m in sorted(actionable_missed, key=lambda x: x.get("day_gain", 0), reverse=True)[:4]:
+            gate_tag = f" | Signal: `{m['gate_status']}`" if m.get("gate_status") else ""
+            report.append(f"- **{m['ticker']}**: Day Gain: `+{m['day_gain']}%` | Low Rebound: `+{m['pct_from_low']}%` | RSI: `{m['rsi']}` | Vol: `{m['vol_ratio']}x`{gate_tag}")
+    if filtered_movers:
+        report.append(f"\n**Filtered Non-Held Movers ({len(filtered_movers)} — Blocked as Designed):**")
+        for m in sorted(filtered_movers, key=lambda x: x.get("day_gain", 0), reverse=True)[:4]:
+            gate_tag = f" | Skipped: `{m['gate_status']}`" if m.get("gate_status") else ""
             report.append(f"- **{m['ticker']}**: Day Gain: `+{m['day_gain']}%` | Low Rebound: `+{m['pct_from_low']}%` | RSI: `{m['rsi']}` | Vol: `{m['vol_ratio']}x`{gate_tag}")
 
     status_items = [f"[OPTIMIZATION] {c}" for c in changes_made] + audit_flags
