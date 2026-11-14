@@ -430,7 +430,9 @@ def run_intraday_scan(bot_advice: str = ""):
     )
 
     # Step 3: Evaluate autonomous 32-ticker candidate setups (or explicit CLI override text)
+    # Refresh config & ledger_state after Step 2 exits so newly freed cash and closed positions are reflected in Step 3.
     config = load_config()
+    ledger_state = get_ledger_state()
     if bot_advice:
         signals = parse_bot_signals(bot_advice)
         print(f"Extracted {len(signals)} explicit signal(s) from CLI input.")

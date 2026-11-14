@@ -45,9 +45,25 @@ from maple_strategy import MapleStrategy
 
 
 def log_to_changelog(entry: str):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(CHANGELOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n\n### Optimization Log [{timestamp}]\n{entry}\n")
+    now = datetime.datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    new_block = f"### Optimization Log [{timestamp}]\n{entry}\n"
+
+    existing = ""
+    if os.path.exists(CHANGELOG_FILE):
+        with open(CHANGELOG_FILE, "r", encoding="utf-8") as f:
+            existing = f.read()
+
+    # Keep only one consolidated retrospective per calendar date by replacing any earlier same-day entry.
+    import re
+    pattern = re.compile(
+        rf"\n*### Optimization Log \[{re.escape(today_str)} [^\]]+\][\s\S]*?(?=\n### Optimization Log \[|\Z)"
+    )
+    cleaned = pattern.sub("", existing).strip("\r\n")
+    output = f"\n\n{cleaned}\n\n\n{new_block}" if cleaned else f"\n\n{new_block}"
+    with open(CHANGELOG_FILE, "w", encoding="utf-8") as f:
+        f.write(output)
 
 
 def load_nav_history() -> Dict[str, Any]:
@@ -225,6 +241,7 @@ def calculate_position_attribution(
     positions: Dict[str, Any],
     total_equity: float,
     calendar_map: Optional[Dict[str, Any]] = None,
+    stock_data_map: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Computes performance and risk metrics for each held position:
@@ -296,7 +313,19 @@ def calculate_position_attribution(
         if weight_pct >= 25.0 and unrealized < 0:
             notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
         if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
-            notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
+            sd = (stock_data_map or {}).get(normalize_ticker(sym), {})
+            ema_5 = sd.get("EMA_5")
+            ema_9 = sd.get("EMA_9")
+            ema_cross = str(sd.get("EMA_Crossover", ""))
+            has_ema = isinstance(ema_5, (int, float)) and isinstance(ema_9, (int, float))
+            is_bearish = (has_ema and ema_5 < ema_9) or ("BEARISH" in ema_cross.upper())
+            below_both_emas = has_ema and cur_p < ema_5 and cur_p < ema_9
+            if (has_ema or ema_cross) and not (is_bearish or below_both_emas):
+                notes.append(
+                    f"Held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d) at {unrealized_pct:.1f}% — retained (Bullish EMA5 > EMA9)"
+                )
+            else:
+                notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
         elif days_held == MapleStrategy.STAGNATION_DAYS - 1 and unrealized < 0:
             notes.append(f"Approaching Day-{MapleStrategy.STAGNATION_DAYS} stagnation check tomorrow ({days_held}d held)")
 
@@ -389,6 +418,7 @@ def run_daily_self_assessment():
     norm_allowed = [normalize_ticker(t) for t in allowed_tickers]
     prefetched = prefetch_histories(norm_allowed) if len(norm_allowed) > 1 else {}
     basket_gains: List[float] = []
+    stock_data_map: Dict[str, Dict[str, Any]] = {}
     for sym in norm_allowed:
         try:
             sd = (
@@ -397,6 +427,7 @@ def run_daily_self_assessment():
                 else get_stock_data(sym, mode="SHORT")
             )
             if sd and isinstance(sd.get("Price"), (int, float)) and sd["Price"] > 0:
+                stock_data_map[sym] = sd
                 if sym in positions and positions[sym].get("shares", 0) > 0:
                     if not live_authoritative or not positions[sym].get("current_price"):
                         positions[sym]["current_price"] = float(sd["Price"])
@@ -411,6 +442,7 @@ def run_daily_self_assessment():
             try:
                 sd = get_stock_data(sym, mode="SHORT")
                 if sd and isinstance(sd.get("Price"), (int, float)) and sd["Price"] > 0:
+                    stock_data_map[normalize_ticker(sym)] = sd
                     if not live_authoritative or not p.get("current_price"):
                         p["current_price"] = float(sd["Price"])
                         refreshed_any = True
@@ -452,7 +484,9 @@ def run_daily_self_assessment():
     # 3. Position Attribution, Sector Concentration & Risk Watchlist
     held_syms = [normalize_ticker(s) for s, p in positions.items() if float(p.get("shares", 0)) > 0]
     cal_map = get_corporate_calendar(held_syms) if held_syms else {}
-    attribution, risk_watchlist = calculate_position_attribution(positions, equity, calendar_map=cal_map)
+    attribution, risk_watchlist = calculate_position_attribution(
+        positions, equity, calendar_map=cal_map, stock_data_map=stock_data_map
+    )
     max_sector_pct = float(config.get("max_sector_pct", 0.35)) * 100.0
     sector_totals: Dict[str, float] = {}
     for pa in attribution:

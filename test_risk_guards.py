@@ -729,7 +729,59 @@ def run_checks():
         assert engh_attr[0]["entry_fee_cad"] == 1.00, f"High-share entry fee hidden: {engh_attr}"
         assert engh_watch and "Approaching Day-4 stagnation check tomorrow" in engh_watch[0]["note"], f"Day-3 early stagnation warning missing: {engh_watch}"
 
-    print("ALL 23 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 24. Nov 13 EOD Fixes: Post-sell ledger refresh in run_intraday_scan, EMA-aware Day-4 watchlist note, and same-day changelog deduplication
+    pre_exit_state = {"mode": "SIMULATED", "cash": 388.03, "total_equity": 5022.84, "positions": {"TECK-B.TO": {"shares": 8.0, "acb": 90.0}}}
+    post_exit_state = {"mode": "SIMULATED", "cash": 1078.67, "total_equity": 5022.84, "positions": {}}
+    seen_held_args = []
+    with patch.object(maple_brain, "is_opening_chop", return_value=False), \
+         patch.object(maple_brain, "is_market_open", return_value=True), \
+         patch.object(maple_brain, "load_config", return_value={"trading_mode": "SIMULATED", "allowed_tickers": ["TECK-B.TO"], "max_position_pct": 0.25}), \
+         patch.object(maple_brain, "get_ledger_state", side_effect=[pre_exit_state, post_exit_state, post_exit_state]), \
+         patch.object(maple_brain, "fetch_latest_market_prices", return_value={"TECK-B.TO": {"Price": 86.33}}), \
+         patch.object(maple_brain, "check_target_stops"), \
+         patch.object(maple_brain, "get_macro_alignment", return_value={"GC=F": True, "CL=F": True, "VIX_PANIC": False}), \
+         patch.object(maple_brain, "evaluate_autonomous_signals", side_effect=lambda md, at, macro_state=None, max_share_price=None, held_tickers=None: (seen_held_args.append(set(held_tickers or set())), [])[1]):
+        maple_brain.run_intraday_scan()
+        assert seen_held_args and seen_held_args[0] == set(), f"Stale pre-exit held_tickers passed to Step 3: {seen_held_args}"
+
+    with patch.object(maple_optimizer, "get_position_holding_days", return_value={"ATRL.TO": 4, "TECK-B.TO": 4}), \
+         patch.object(maple_optimizer, "get_position_last_buy_info", return_value={}):
+        _, stag_watch = maple_optimizer.calculate_position_attribution(
+            {
+                "ATRL.TO": {"shares": 6.0, "acb": 91.68, "current_price": 91.23},
+                "TECK-B.TO": {"shares": 8.0, "acb": 90.06, "current_price": 86.33},
+            },
+            5022.84,
+            stock_data_map={
+                "ATRL.TO": {"EMA_5": 91.10, "EMA_9": 90.40, "EMA_Crossover": "BULLISH (EMA5 > EMA9)"},
+                "TECK-B.TO": {"EMA_5": 87.20, "EMA_9": 88.10, "EMA_Crossover": "BEARISH (EMA5 < EMA9)"},
+            },
+        )
+        watch_map = {w["ticker"]: w["note"] for w in stag_watch}
+        assert "retained (Bullish EMA5 > EMA9)" in watch_map["ATRL.TO"], f"Bullish 4d hold mislabeled as stagnant: {watch_map}"
+        assert "Stagnant loser" in watch_map["TECK-B.TO"], f"Bearish 4d loser missing stagnant flag: {watch_map}"
+
+    import tempfile
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as tmpf:
+        tmp_path = tmpf.name
+        today_pfx = datetime.datetime.now().strftime("%Y-%m-%d")
+        tmpf.write(
+            f"\n\n### Optimization Log [2026-11-12 16:11:03]\nPrior day entry\n"
+            f"\n\n### Optimization Log [{today_pfx} 15:46:30]\nEarly duplicate\n"
+        )
+    try:
+        with patch.object(maple_optimizer, "CHANGELOG_FILE", tmp_path):
+            maple_optimizer.log_to_changelog("Final close entry")
+        with open(tmp_path, "r", encoding="utf-8") as rf:
+            dedup_text = rf.read()
+        assert "Prior day entry" in dedup_text and "Early duplicate" not in dedup_text and "Final close entry" in dedup_text, (
+            f"Same-day changelog deduplication failed: {dedup_text}"
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    print("ALL 24 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
