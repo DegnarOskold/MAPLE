@@ -733,6 +733,7 @@ def run_checks():
     pre_exit_state = {"mode": "SIMULATED", "cash": 388.03, "total_equity": 5022.84, "positions": {"TECK-B.TO": {"shares": 8.0, "acb": 90.0}}}
     post_exit_state = {"mode": "SIMULATED", "cash": 1078.67, "total_equity": 5022.84, "positions": {}}
     seen_held_args = []
+    import importlib
     with patch.object(maple_brain, "is_opening_chop", return_value=False), \
          patch.object(maple_brain, "is_market_open", return_value=True), \
          patch.object(maple_brain, "load_config", return_value={"trading_mode": "SIMULATED", "allowed_tickers": ["TECK-B.TO"], "max_position_pct": 0.25}), \
@@ -740,6 +741,8 @@ def run_checks():
          patch.object(maple_brain, "fetch_latest_market_prices", return_value={"TECK-B.TO": {"Price": 86.33}}), \
          patch.object(maple_brain, "check_target_stops"), \
          patch.object(maple_brain, "get_macro_alignment", return_value={"GC=F": True, "CL=F": True, "VIX_PANIC": False}), \
+         patch.object(importlib, "reload", side_effect=lambda m: m), \
+         patch.object(telegram_notifier, "send_scan_update", return_value=True), \
          patch.object(maple_brain, "evaluate_autonomous_signals", side_effect=lambda md, at, macro_state=None, max_share_price=None, held_tickers=None: (seen_held_args.append(set(held_tickers or set())), [])[1]):
         maple_brain.run_intraday_scan()
         assert seen_held_args and seen_held_args[0] == set(), f"Stale pre-exit held_tickers passed to Step 3: {seen_held_args}"
