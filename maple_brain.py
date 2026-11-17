@@ -518,7 +518,7 @@ def run_intraday_scan(bot_advice: str = ""):
                 )
 
                 target, stop = MapleStrategy.calculate_targets(
-                    current_price, stock_info, shares=tot_est_shares, cost_basis=est_basis
+                    current_price, stock_info, shares=tot_est_shares, cost_basis=est_basis, signal_type=sig_type
                 )
 
                 print(

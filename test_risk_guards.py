@@ -798,7 +798,29 @@ def run_checks():
         datetime.datetime(2026, 11, 16, 16, 11, 4),
     ) == 4, "Tuesday buy evaluated next Monday should be 4 trading days held, not 6 calendar days"
 
-    print("ALL 25 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 26. Nov 16 Weekly Audit Fixes: ADX >= 15.0 hard trend floor (disallowing Single-Bypass in dead chop) & +3.5% Capitulation target cap
+    adx_chop_pct, adx_chop_r = MapleStrategy.calculate_tranche_size(
+        {"Price": 89.81, "Open": 88.50, "EMA_5": 89.20, "EMA_9": 88.80, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 2.08, "ADX_14": 9.42, "RSI_7": 55.91},
+        signal_type="REGULAR BUY",
+    )
+    assert adx_chop_pct == 0.0 and "Trend Floor" in adx_chop_r, f"Sub-15 ADX chop was not blocked: {adx_chop_pct}, {adx_chop_r}"
+
+    adx_bypass_pct, adx_bypass_r = MapleStrategy.calculate_tranche_size(
+        {"Price": 89.81, "Open": 88.50, "EMA_5": 89.20, "EMA_9": 88.80, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 2.08, "ADX_14": 17.5, "RSI_7": 55.91},
+        signal_type="REGULAR BUY",
+    )
+    assert adx_bypass_pct > 0.0 and "Single-Bypass Rule" in adx_bypass_r, f"Valid 15-20 ADX single-bypass failed: {adx_bypass_pct}, {adx_bypass_r}"
+
+    rus_cap_tgt, rus_cap_stp = MapleStrategy.calculate_targets(
+        76.91,
+        {"ATR_5": 2.80, "BB_Mid": 80.76, "RSI_7": 27.22},
+        shares=10.0,
+        cost_basis=76.91,
+        signal_type="CAPITULATION REVERSAL",
+    )
+    assert rus_cap_tgt == 79.60 and rus_cap_stp == 73.06, f"Capitulation target not capped at +3.5%: tgt={rus_cap_tgt}, stp={rus_cap_stp}"
+
+    print("ALL 26 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

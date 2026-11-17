@@ -31,6 +31,7 @@ class MapleStrategy:
     VOLUME_BOOST_RATIO = 1.60
     MIN_LIQUID_VOL_SMA10 = 150000.0
     MIN_SURGE_DOLLAR_VOL_CAD = 1000000.0
+    ADX_HARD_FLOOR = 15.0
     ADX_TREND_THRESHOLD = 20.0
     ADX_STRONG_THRESHOLD = 28.0
     RSI_OVERSOLD_MAX = 35.0
@@ -44,6 +45,7 @@ class MapleStrategy:
     STOP_LOSS_PCT = 5.0
     HALF_RISK_TRIGGER_PCT = 2.0
     BREAKEVEN_TRIGGER_PCT = 2.5
+    CAPITULATION_TARGET_PCT = 3.5
     ATR_TARGET_MULTIPLIER = 1.5
     STAGNATION_DAYS = 4
     COMMISSION_PER_ORDER_CAD = 1.00
@@ -65,7 +67,9 @@ class MapleStrategy:
             cls.CAPITULATION_MAX_TRANCHE_PCT = float(sp.get("capitulation_max_tranche_pct", cls.CAPITULATION_MAX_TRANCHE_PCT))
             cls.MIN_SCALED_VOL_RATIO = float(sp.get("min_scaled_vol_ratio", cls.MIN_SCALED_VOL_RATIO))
             cls.VOLUME_BOOST_RATIO = float(sp.get("volume_boost_threshold", cls.VOLUME_BOOST_RATIO))
+            cls.ADX_HARD_FLOOR = float(sp.get("adx_hard_floor", cls.ADX_HARD_FLOOR))
             cls.ADX_STRONG_THRESHOLD = float(sp.get("adx_strong_trend", cls.ADX_STRONG_THRESHOLD))
+            cls.CAPITULATION_TARGET_PCT = float(sp.get("capitulation_target_pct", cls.CAPITULATION_TARGET_PCT))
             cls.STOP_LOSS_PCT = float(cfg.get("stop_loss_pct", cls.STOP_LOSS_PCT))
             cls.HALF_RISK_TRIGGER_PCT = float(cfg.get("half_risk_trigger_pct", cls.HALF_RISK_TRIGGER_PCT))
             cls.BREAKEVEN_TRIGGER_PCT = float(cfg.get("breakeven_trigger_pct", cls.BREAKEVEN_TRIGGER_PCT))
@@ -151,6 +155,9 @@ class MapleStrategy:
 
             if isinstance(vol_ratio, (int, float)) and vol_ratio < cls.MIN_SCALED_VOL_RATIO:
                 return 0.0, f"BLOCKED by Low Volume: Vol_Ratio ({vol_ratio}x) below {cls.MIN_SCALED_VOL_RATIO:.2f}x minimum threshold"
+
+            if isinstance(adx, (int, float)) and adx < cls.ADX_HARD_FLOOR:
+                return 0.0, f"BLOCKED by Trend Floor: ADX_14 ({adx} < {cls.ADX_HARD_FLOOR:.1f} hard floor) indicates trendless chop (Single-Bypass disallowed)"
 
             adx_ok = isinstance(adx, (int, float)) and adx >= cls.ADX_TREND_THRESHOLD
             rsi_std_ok = isinstance(rsi, (int, float)) and rsi <= cls.RSI_STANDARD_MAX
@@ -239,6 +246,7 @@ class MapleStrategy:
         stock_data: Dict[str, Any],
         shares: float = 1.0,
         cost_basis: Optional[float] = None,
+        signal_type: str = "REGULAR",
     ) -> Tuple[float, float]:
         """Calculates Target Sell Price and Stop Loss Price.
         Explicitly factors in two-way trade commissions (entry + exit) to guarantee
@@ -257,6 +265,10 @@ class MapleStrategy:
 
         atr = stock_data.get("ATR_5")
         bb_mid = stock_data.get("BB_Mid")
+        rsi = stock_data.get("RSI_7")
+        is_capitulation = ("CAPITULATION" in str(signal_type).upper()) or (
+            isinstance(rsi, (int, float)) and rsi < cls.RSI_OVERSOLD_MAX
+        )
 
         stop_loss = round(base_price * (1.0 - cls.STOP_LOSS_PCT / 100.0), 2)
 
@@ -266,7 +278,10 @@ class MapleStrategy:
             stop_loss = round(stop_loss * 0.99, 2)
 
         target = None
-        if isinstance(bb_mid, (int, float)) and bb_mid >= min_target:
+        if is_capitulation:
+            # Mean-reversion capitulation bounces harvest at +3.5% (capped below extended BB_Mid/ATR breakout targets)
+            target = round(base_price * (1.0 + cls.CAPITULATION_TARGET_PCT / 100.0), 2)
+        elif isinstance(bb_mid, (int, float)) and bb_mid >= min_target:
             target = round(float(bb_mid), 2)
         elif isinstance(atr, (int, float)) and atr > 0:
             target = round(base_price + (atr * cls.ATR_TARGET_MULTIPLIER), 2)
