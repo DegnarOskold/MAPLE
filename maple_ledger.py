@@ -760,6 +760,9 @@ def execute_buy(
             order_id = order_res.get("orderId")
             if not order_id and "orders" in order_res and order_res["orders"]:
                 order_id = order_res["orders"][0].get("id")
+            if not order_id or str(order_id).strip().lower() == "none":
+                print(f"[MAPLE LIVE ORDER REJECTED] Broker did not return a valid orderId for {ticker} ({order_res.get('raw_response', order_res)})")
+                return None
 
             print(f"[MAPLE LIVE SUCCESS] Limit Buy Order #{order_id} submitted for {shares} {ticker} @ ${limit_price:.2f}")
 
@@ -1022,6 +1025,9 @@ def execute_sell(
             order_id = order_res.get("orderId")
             if not order_id and "orders" in order_res and order_res["orders"]:
                 order_id = order_res["orders"][0].get("id")
+            if not order_id or str(order_id).strip().lower() == "none":
+                print(f"[MAPLE LIVE ORDER REJECTED] Broker did not return a valid orderId for {ticker} ({order_res.get('raw_response', order_res)})")
+                return None
 
             print(f"[MAPLE LIVE SUCCESS] Limit Sell Order #{order_id} submitted for {shares} {ticker} @ ${limit_price:.2f}")
 
@@ -1196,12 +1202,18 @@ def sync_working_orders() -> Dict[str, Any]:
         for raw_ticker, p_info in list(pending.items()):
             ticker = normalize_ticker(raw_ticker)
             order_id = p_info.get("order_id")
-            if not order_id:
+            if not order_id or str(order_id).strip().lower() == "none":
+                print(f"[MAPLE SYNC CLEANUP] Clearing invalid pending order_id ({order_id}) for {ticker}.")
                 del updated_pending[raw_ticker]
                 changed = True
                 continue
 
             status_res = client.get_order_status(account_id, str(order_id))
+            if status_res.get("statusCode") == 400:
+                print(f"[MAPLE SYNC CLEANUP] Clearing invalid Order #{order_id} for {ticker}: {status_res.get('error', '400')}")
+                del updated_pending[raw_ticker]
+                changed = True
+                continue
             status_str = status_res.get("order_status", "")
             cum_fill = float(status_res.get("cum_fill", 0.0))
             shares = float(p_info.get("shares", 0.0))
