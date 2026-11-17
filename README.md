@@ -1,23 +1,28 @@
-# MAPLE: Autonomous TSX Algorithmic Trading System
+# MAPLE: Autonomous US Equities Algorithmic Trading System
 
-**MAPLE** (**M**arket **A**nalyzer & **P**ortfolio **L**edger **E**ngine) is a self-contained, autonomous algorithmic trading system designed for Canadian equities on the Toronto Stock Exchange (TSX). Built from the ground up for strict capital preservation, MAPLE executes rule-based swing-trading strategies across a vetted 32-ticker AAOIFI Shariah-compliant universe, connecting directly to **Interactive Brokers (IBKR) Canada** via the local Client Portal Gateway (or running in zero-risk paper-trading **SIMULATED** mode).
+**MAPLE** (**M**arket **A**nalyzer & **P**ortfolio **L**edger **E**ngine) is a self-contained, autonomous algorithmic trading system designed for US equities on **NYSE and NASDAQ**. Built from the ground up for strict capital preservation, MAPLE executes rule-based swing-trading strategies across a **47-ticker AAOIFI Shariah-compliant, Zoya-certified US universe**, connecting directly to **Interactive Brokers (IBKR)** via the local Client Portal Gateway with `SMART` USD routing (or running in zero-risk paper-trading **SIMULATED** mode).
 
 ---
 
 ## Key Features
 
-- **100% Self-Contained Local Engine**: Zero external folder or third-party cloud dependencies. Market data, technical analysis (`pandas-ta`), corporate earnings calendars, and macro commodity alignment (`GC=F` Gold, `CL=F` Crude Oil) run entirely locally via standard Python libraries.
-- **Strict Shariah-Compliant Gatekeeper**: Hardcoded 32-ticker universe vetted for AAOIFI financial ratio and business activity compliance across 6 sectors (Technology, Industrials & Rail, Precious Metals, Energy & Uranium, Base Metals & Materials, Consumer & Packaging).
+- **100% Self-Contained Local Engine**: Market data (`yfinance`), technical analysis (`pandas-ta`), corporate earnings calendars, and macro alignment (`GC=F` Gold, `CL=F` Crude Oil, `^VIX` Panic Regime) run locally via standard Python libraries.
+- **Strict Shariah-Compliant Gatekeeper**: Hardcoded **47-ticker** US equity universe vetted for AAOIFI financial ratio and business activity compliance across 6 sectors (**Technology**, **Healthcare**, **Energy**, **Industrials**, **Consumer**, **Materials**).
 - **Institutional Risk & Capital Preservation Guards**:
   - **Rule 3 Opening Chop Guard (09:30–10:00 AM ET)**: Zero buy orders during opening price discovery; held assets monitored with a dynamic `2.0%` stop buffer to prevent opening-wick stop-outs while harvesting opening spikes.
-  - **Single-Share Whole-Lot Floor (`<= 30%` NAV)**: Tailored for small accounts ($1,000 seed), allowing 1-share entry on valid signals up to 30% of portfolio NAV while enforcing cash reserve ($20 CAD buffer), $400 order cap, and 35% sector caps.
-  - **Two-Way Commission Net Hurdle**: Target prices calculate round-trip IBKR trading commissions ($2.00 minimum drag) to guarantee a minimum `+2.5%` net return on invested capital.
-  - **Scale-In Cap & Red-Candle Guard**: Maximum 2 entries per position cycle with mandatory 4-hour cooldown and hard block against scaling into red intraday candles.
-  - **Automated Breakeven Stop Ratchet**: Once an open position reaches `+2.0%` unrealized gain, its protective stop is automatically ratcheted to cost basis (ACB + commission).
-  - **4-Day Stagnation Exit**: Exits stagnant losing positions held $\ge$ 4 days with bearish moving averages, with a built-in deferral for recovering intraday rallies.
+  - **Single-Share Whole-Lot Floor (`<= 30%` NAV)**: Allows 1-share entry on valid signals up to 30% of portfolio NAV while enforcing dynamic order caps, `15%–35%` tranches, and `35%` max sector concentration.
+  - **Two-Way Commission Net Hurdle**: Target prices calculate round-trip IBKR commissions (`$2.00` minimum drag) to guarantee a minimum `+2.5%` net return on invested capital (`+3.5%` target cap on oversold Capitulation Reversal mean-reversion bounces).
+  - **Trend & Volume Discipline**: Hard `ADX >= 15.0` trend floor (disallowing Single-Bypass in dead sideways chop), `1.00x` minimum volume ratio for scaled entries, `RSI <= 68.0` overbought ceiling, max `3.0%` EMA5 extension cap, and `^VIX >= 25` (or `+10%` spike) macro panic gating.
+  - **Scale-In Cap & Red-Candle Guard**: Maximum 2 entries per position cycle with mandatory 4-hour cooldown, `+0.5%` / `+1.0%` progress hurdle over Entry #1, and hard block against scaling into red intraday candles.
+  - **Tiered Automated Stop Ratchets**:
+    - `+2.0%` unrealized gain: **Tier 0.5** half-risk stop (`-2.5%` below ACB)
+    - `+2.5%` unrealized gain: **Tier 1** breakeven stop (`ACB + $0.50`)
+    - `+3.0%` unrealized gain: **Tier 2** profit-lock stop (`+1.5%` net above ACB)
+    - `+4.5%` unrealized gain: **Tier 3** trailing stop (`-1.25%` below live price)
+  - **4-Trading-Day Stagnation Exit**: Exits stagnant losing positions held $\ge 4$ weekday trading sessions with bearish EMA alignment (`EMA5 < EMA9` or below both EMAs), with a built-in deferral for recovering intraday rallies.
   - **Earnings Binary Event Shield**: Blocks new buy entries within 3 trading days of scheduled quarterly earnings reports.
-  - **Daily Drawdown Circuit Breaker**: Halts all buying if daily portfolio equity drops $\ge \$40\text{ CAD}$ (4%) vs. previous day close.
-- **Autonomous Retrospective & Optimization**: Evaluates daily closing NAV deltas, assesses position attribution, flags risk watchlists, and tunes strategy thresholds after market close (04:10 PM ET).
+  - **Daily Drawdown Circuit Breaker**: Halts all buying if daily portfolio equity drops $\ge 4\%$ (or configured `daily_loss_limit_cad` floor) vs. previous day close.
+- **Autonomous Retrospective & Optimization**: Evaluates daily closing NAV deltas (cash-flow & TWR adjusted), position attribution, risk watchlists, and filtered vs. actionable movers after market close (`04:10 PM ET`).
 - **Multi-Channel Telegram Alerts**: Dispatches real-time fill confirmations, pending order updates, scan summaries, and formatted EOD retrospective reports.
 
 ---
@@ -26,23 +31,23 @@
 
 ```
 MAPLE/
-├── maple_brain.py             # Intraday orchestrator, 32-ticker candidate evaluation, chop guard
-├── maple_ledger.py            # Trade execution, position tracking, cash/ACB accounting, risk gates
-├── maple_strategy.py          # Dynamic tranche sizing (15%-35%), scoring rules, target/stop math
-├── maple_market.py            # Real-time TSX data, 24h-cached earnings calendar, macro commodities
-├── maple_optimizer.py         # Daily post-close performance audit, attribution, strategy tuning
-├── maple_daemon.py            # Standalone continuous background loop
-├── maple_compare.py           # Benchmarks MAPLE performance against S&P/TSX 60 (XIU.TO)
-├── ibkr_client.py             # Interactive Brokers Client Portal Gateway REST API client
-├── ibkr_keepalive.py          # Gateway SSO session keepalive daemon (45s tickle)
-├── telegram_notifier.py       # Telegram notification dispatcher
-├── test_risk_guards.py        # 14-point regression self-check test suite
-├── start_ibkr_gateway.bat     # Windows launcher for local IBKR Client Portal Gateway
-├── run_maple.bat              # Windows launcher for MAPLE continuous daemon
-├── requirements.txt           # Python package dependencies
-├── .gitignore                 # Protects credentials, account IDs, and trade history
-├── .env.example               # Template for environment secrets
-├── maple_config.example.json  # Template for core trading parameters
+├── maple_brain.py               # Intraday orchestrator, 47-ticker US evaluation, chop guard
+├── maple_ledger.py              # Trade execution, position tracking, cash/ACB accounting, risk gates
+├── maple_strategy.py            # Dynamic tranche sizing, scoring rules, target/stop math
+├── maple_market.py              # Real-time US data, 24h-cached earnings calendar, macro alignment
+├── maple_optimizer.py           # Daily post-close performance audit, attribution, changelog logging
+├── maple_daemon.py              # Standalone continuous background loop
+├── maple_compare.py             # Benchmarks MAPLE performance against S&P 500 (SPY)
+├── ibkr_client.py               # Interactive Brokers Client Portal Gateway REST API client (SMART/USD)
+├── ibkr_keepalive.py            # Gateway SSO session keepalive daemon (45s tickle)
+├── telegram_notifier.py         # Telegram notification dispatcher
+├── test_risk_guards.py          # 27-point regression self-check test suite
+├── start_ibkr_gateway.bat       # Windows launcher for local IBKR Client Portal Gateway
+├── run_maple.bat                # Windows launcher for MAPLE continuous daemon
+├── requirements.txt             # Python package dependencies
+├── .gitignore                   # Protects credentials, account IDs, and trade history
+├── .env.example                 # Template for environment secrets
+├── maple_config.example.json    # Template for core trading parameters (USD / 47 US equities)
 └── telegram_config.example.json # Template for Telegram bot settings
 ```
 
@@ -85,12 +90,11 @@ cp maple_config.example.json maple_config.json
 Open `maple_config.json` in your text editor and customize:
 - `"trading_mode"`: Set to `"SIMULATED"` for risk-free paper trading or `"LIVE"` for real broker execution.
 - `"account_id"`: Set to your Interactive Brokers account number (e.g., `"U12345678"`). In `SIMULATED` mode, this can be left as `"SIM"`.
-- `"initial_cash"`: Your starting account balance in CAD (e.g., `1000.0`).
-- Adjust risk thresholds (e.g., `"max_position_pct": 0.25`, `"max_sector_pct": 0.35`, `"daily_loss_limit_cad": 40.0`).
+- `"account_currency"`: `"USD"` for US equities.
+- `"initial_cash"`: Your starting account balance in USD (e.g., `1000.0`).
+- Adjust risk thresholds (e.g., `"max_position_pct": 0.25`, `"max_sector_pct": 0.35`, `"daily_loss_limit_pct": 0.04`).
 
 ### Step 2: Configure Telegram Notifications (Optional)
-
-If you wish to receive real-time trade alerts and daily EOD performance summaries on Telegram:
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) on Telegram and copy your API Token.
 2. Retrieve your Telegram User or Channel Chat ID (via [@userinfobot](https://t.me/userinfobot)).
@@ -113,8 +117,6 @@ If you wish to receive real-time trade alerts and daily EOD performance summarie
 
 ### Step 3: Interactive Brokers Client Portal Gateway Setup (LIVE Mode Only)
 
-If trading in `LIVE` mode on Interactive Brokers Canada:
-
 1. Download the **Interactive Brokers Client Portal Web API Gateway** from the official IBKR website:
    [https://www.interactivebrokers.github.io/cpwebapi/](https://www.interactivebrokers.github.io/cpwebapi/)
 2. Extract the archive into a folder named `clientportal/` inside the `MAPLE/` root directory.
@@ -136,7 +138,7 @@ If trading in `LIVE` mode on Interactive Brokers Canada:
 
 ## Verifying the Test Suite
 
-Before running live capital, verify that all 14 mathematical risk guards, filters, and standalone decoupling checks pass:
+Before running live capital, verify that all 27 mathematical risk guards, filters, and standalone decoupling checks pass:
 
 ```bash
 python test_risk_guards.py
@@ -144,7 +146,7 @@ python test_risk_guards.py
 
 Expected output:
 ```
-ALL 14 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!
+ALL 27 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!
 ```
 
 ---
@@ -153,7 +155,7 @@ ALL 14 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY
 
 ### Option A: Continuous Standalone Daemon
 
-Run the all-in-one background daemon (monitors market hours, executes scans every 15 minutes, runs opening chop guard, and triggers EOD optimization):
+Run the all-in-one background daemon (monitors US market hours, executes scans every 15 minutes, runs opening chop guard, and triggers EOD optimization):
 
 - **Windows**: Double-click `run_maple.bat` (or run `python maple_daemon.py`).
 - **Linux/macOS**: `python maple_daemon.py`.
@@ -165,7 +167,7 @@ If integrating with system schedulers (`cron`, Windows Task Scheduler, or AI ass
 | Time (ET) | Frequency | Command | Objective |
 | :--- | :--- | :--- | :--- |
 | **09:30 – 10:00 AM** | Every 5 min | `python maple_brain.py --chop-guard` | Held-assets profit target harvesting & chop stop protection |
-| **10:00 AM – 03:45 PM** | Every 15 min | `python maple_brain.py` | 32-ticker candidate scanning & limit order execution |
+| **10:00 AM – 03:45 PM** | Every 15 min | `python maple_brain.py` | 47-ticker US candidate scanning & limit order execution |
 | **04:10 PM** | Mon–Fri Close | `python maple_optimizer.py` | Daily performance audit & retrospective logging |
 
 ### Manual Single-Scan Execution
@@ -175,7 +177,7 @@ To execute an immediate market scan at any time:
 python maple_brain.py
 ```
 
-To compare current portfolio performance against the benchmark:
+To compare current portfolio performance against the S&P 500 (`SPY`) benchmark:
 ```bash
 python maple_compare.py
 ```
