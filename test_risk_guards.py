@@ -31,9 +31,14 @@ def run_checks():
     )
     assert valid_cap == 0.15 and "Starter" in r3, f"Valid capitulation should size at 0.15: {valid_cap}, {r3}"
 
-    # 2. Full 32-ticker sector map + 35% sector cap (including resting BUY pending_orders)
+    # 2. Full 47-ticker US sector map + 35% sector cap (including resting BUY pending_orders)
     assert set(maple_ledger.SECTOR_MAP.keys()) == maple_ledger.SHARIAH_COMPLIANT_BASKET
     assert all(maple_ledger.get_ticker_sector(t) != "Other" for t in maple_ledger.SHARIAH_COMPLIANT_BASKET)
+    _legacy_tsx_bkt = set(maple_ledger.SHARIAH_COMPLIANT_BASKET) | set(maple_ledger._LEGACY_TSX_SECTORS.keys())
+    _legacy_tsx_patch = patch.object(maple_ledger, "SHARIAH_COMPLIANT_BASKET", _legacy_tsx_bkt)
+    _legacy_brain_patch = patch.object(maple_brain, "SHARIAH_COMPLIANT_BASKET", _legacy_tsx_bkt)
+    _legacy_tsx_patch.start()
+    _legacy_brain_patch.start()
 
     base_cfg = {
         "trading_mode": "SIMULATED",
@@ -820,7 +825,16 @@ def run_checks():
     )
     assert rus_cap_tgt == 79.60 and rus_cap_stp == 73.06, f"Capitulation target not capped at +3.5%: tgt={rus_cap_tgt}, stp={rus_cap_stp}"
 
-    print("ALL 26 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 27. US Equities Migration: 47 Zoya-certified US tickers, US normalization, and US commodity macro alignment
+    _legacy_tsx_patch.stop()
+    _legacy_brain_patch.stop()
+    assert len(maple_ledger.SHARIAH_COMPLIANT_BASKET) == 47, f"Expected 47 US tickers, got {len(maple_ledger.SHARIAH_COMPLIANT_BASKET)}"
+    assert maple_ledger.normalize_ticker("NVDA") == "NVDA" and maple_ledger.normalize_ticker("BRK.B") == "BRK-B"
+    assert maple_ledger.normalize_ticker("PAAS.TO") == "PAAS.TO"
+    assert maple_market.is_macro_aligned("NEM", {"GC=F": False, "CL=F": True, "VIX_PANIC": True})[0] is False
+    assert maple_market.is_macro_aligned("XOM", {"GC=F": False, "CL=F": True, "VIX_PANIC": True})[0] is True
+
+    print("ALL 27 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

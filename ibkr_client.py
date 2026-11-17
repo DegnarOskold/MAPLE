@@ -80,14 +80,21 @@ class IBKRClient:
             account_id = self.get_primary_account_id()
         
         try:
+            from maple_ledger import load_config
+            acct_ccy = str(load_config().get("account_currency", "USD")).upper()
+        except Exception:
+            acct_ccy = "USD"
+
+        try:
             res = self.session.get(f"{self.base_url}/portfolio/{account_id}/ledger", timeout=5)
             if res.status_code == 200 and res.text:
                 ledger = res.json()
-                cad_entry = ledger.get("CAD", {}) if isinstance(ledger, dict) else {}
+                ccy_entry = ledger.get(acct_ccy, {}) if isinstance(ledger, dict) else {}
                 base_entry = ledger.get("BASE", {}) if isinstance(ledger, dict) else {}
-                cash = cad_entry.get("cashbalance", base_entry.get("cashbalance", 0.0))
-                total_equity = cad_entry.get("netliquidationvalue", base_entry.get("netliquidationvalue", cash))
-                stock_val = cad_entry.get("stockmarketvalue", base_entry.get("stockmarketvalue", 0.0))
+                cad_entry = ledger.get("CAD", {}) if isinstance(ledger, dict) else {}
+                cash = ccy_entry.get("cashbalance", base_entry.get("cashbalance", cad_entry.get("cashbalance", 0.0)))
+                total_equity = ccy_entry.get("netliquidationvalue", base_entry.get("netliquidationvalue", cad_entry.get("netliquidationvalue", cash)))
+                stock_val = ccy_entry.get("stockmarketvalue", base_entry.get("stockmarketvalue", cad_entry.get("stockmarketvalue", 0.0)))
                 
                 # Summary for buying power
                 bp = cash
@@ -183,7 +190,8 @@ class IBKRClient:
                 continue
 
             if isinstance(res, list):
-                # Prefer CAD currency on TSE
+                is_tsx = ticker_upper.endswith(".TO")
+                us_exchanges = ("NASDAQ", "NYSE", "ARCA", "BATS", "IEX", "ISLAND")
                 for item in res:
                     cid = item.get("conid")
                     try:
@@ -197,9 +205,9 @@ class IBKRClient:
                         info = self.session.get(f"{self.base_url}/iserver/contract/{cid_int}/info", timeout=5).json()
                     except Exception:
                         continue
-                    valid_exchanges = info.get("valid_exchanges", "")
-                    currency = info.get("currency", "")
-                    if "TSE" in valid_exchanges and currency == "CAD":
+                    valid_exchanges = str(info.get("valid_exchanges", ""))
+                    currency = str(info.get("currency", ""))
+                    if is_tsx and "TSE" in valid_exchanges and currency == "CAD":
                         matched = {
                             "symbol": ticker_upper,
                             "symbolId": cid_int,
@@ -209,8 +217,18 @@ class IBKRClient:
                             "exchange": "TSE"
                         }
                         break
+                    if not is_tsx and currency == "USD" and any(ex in valid_exchanges for ex in us_exchanges):
+                        matched = {
+                            "symbol": ticker_upper,
+                            "symbolId": cid_int,
+                            "conid": cid_int,
+                            "company_name": info.get("company_name", item.get("description")),
+                            "currency": currency,
+                            "exchange": "SMART"
+                        }
+                        break
                 
-                # Fallback if no specific TSE match found
+                # Fallback if no specific exchange match found
                 if not matched and res:
                     for item in res:
                         cid = item.get("conid")
@@ -228,7 +246,7 @@ class IBKRClient:
                                 "symbolId": cid_int,
                                 "conid": cid_int,
                                 "company_name": info.get("company_name", item.get("description")),
-                                "currency": info.get("currency", "CAD"),
+                                "currency": info.get("currency", "CAD" if is_tsx else "USD"),
                                 "exchange": info.get("exchange", "SMART")
                             }
                             break

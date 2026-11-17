@@ -25,8 +25,8 @@ MAPLE_DIR = os.path.dirname(os.path.abspath(__file__))
 CALENDAR_CACHE_FILE = os.path.join(MAPLE_DIR, "corporate_calendar_cache.json")
 CALENDAR_CACHE_TTL = 86400  # 24 hours
 
-GOLD_LINKED_TICKERS = {"ABX.TO", "AEM.TO", "FNV.TO", "WPM.TO", "PAAS.TO", "AGI.TO"}
-OIL_LINKED_TICKERS = {"CNQ.TO", "SU.TO", "IMO.TO", "CVE.TO"}
+GOLD_LINKED_TICKERS = {"NEM", "FCX", "ABX.TO", "AEM.TO", "FNV.TO", "WPM.TO", "PAAS.TO", "AGI.TO"}
+OIL_LINKED_TICKERS = {"XOM", "CVX", "COP", "EOG", "SLB", "CNQ.TO", "SU.TO", "IMO.TO", "CVE.TO"}
 
 
 def _now_et() -> datetime.datetime:

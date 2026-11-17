@@ -415,7 +415,7 @@ def send_retrospective_report(
             lines.append(f"• {prefix}{chg}")
     else:
         lines.append("• All sector caps (max 35%), stop buffers, and drawdown limits within operating boundaries.")
-    lines.append("• 32 AAOIFI-vetted TSX equities active in surveillance.")
+    lines.append("• 47 AAOIFI-vetted US equities active in surveillance.")
 
     message = "\n".join(lines)
     return send_telegram_message(message)

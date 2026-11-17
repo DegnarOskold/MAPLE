@@ -28,56 +28,84 @@ CONFIG_FILE = os.path.join(MAPLE_DIR, "maple_config.json")
 ADVICE_FILE = os.path.join(MAPLE_DIR, "maple_advice_history.txt")
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
 
-# Strict Gatekeeper Universe: No order may be submitted outside this basket (32 vetted tickers)
+# Strict Gatekeeper Universe: No order may be submitted outside this basket (47 Zoya-certified US tickers)
 SHARIAH_COMPLIANT_BASKET = {
-    "CNQ.TO", "ABX.TO", "CP.TO", "GIB-A.TO", "WCN.TO", "CLS.TO",
-    "SHOP.TO", "AEM.TO", "CNR.TO", "CCO.TO", "CSU.TO", "TECK-B.TO",
-    "SAP.TO", "TIH.TO", "CCL-B.TO", "ATRL.TO", "ATZ.TO", "STN.TO", "FNV.TO",
-    "SU.TO", "IMO.TO", "CVE.TO", "TFII.TO", "RUS.TO", "DSG.TO",
-    "KXS.TO", "ENGH.TO", "WPM.TO", "PAAS.TO", "AGI.TO", "WFG.TO", "RCH.TO"
+    # Technology & Semiconductors (14)
+    "AAPL", "NVDA", "ANET", "QCOM", "TXN", "AMAT", "LRCX", "MRVL", "ON",
+    "CRWD", "FTNT", "CRM", "ADBE", "CSCO",
+    # Healthcare & MedTech (8)
+    "JNJ", "ABBV", "MRK", "GILD", "ISRG", "BSX", "EW", "DHR",
+    # Energy (5)
+    "XOM", "CVX", "COP", "EOG", "SLB",
+    # Industrials & Logistics (7)
+    "ETN", "EMR", "ROK", "ITW", "ODFL", "FAST", "CSX",
+    # Consumer & Retail (8)
+    "PG", "KO", "PEP", "HD", "TJX", "TSLA", "NKE", "MNST",
+    # Materials & Mining (5)
+    "APD", "SHW", "VMC", "FCX", "NEM",
 }
 
 SECTOR_MAP = {
-    # Precious Metals (6)
+    # Technology & Semiconductors (14)
+    "AAPL": "Technology", "NVDA": "Technology", "ANET": "Technology", "QCOM": "Technology",
+    "TXN": "Technology", "AMAT": "Technology", "LRCX": "Technology", "MRVL": "Technology",
+    "ON": "Technology", "CRWD": "Technology", "FTNT": "Technology", "CRM": "Technology",
+    "ADBE": "Technology", "CSCO": "Technology",
+    # Healthcare & MedTech (8)
+    "JNJ": "Healthcare", "ABBV": "Healthcare", "MRK": "Healthcare", "GILD": "Healthcare",
+    "ISRG": "Healthcare", "BSX": "Healthcare", "EW": "Healthcare", "DHR": "Healthcare",
+    # Energy (5)
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy", "EOG": "Energy", "SLB": "Energy",
+    # Industrials & Logistics (7)
+    "ETN": "Industrials", "EMR": "Industrials", "ROK": "Industrials", "ITW": "Industrials",
+    "ODFL": "Industrials", "FAST": "Industrials", "CSX": "Industrials",
+    # Consumer & Retail (8)
+    "PG": "Consumer", "KO": "Consumer", "PEP": "Consumer", "HD": "Consumer",
+    "TJX": "Consumer", "TSLA": "Consumer", "NKE": "Consumer", "MNST": "Consumer",
+    # Materials & Mining (5)
+    "APD": "Materials", "SHW": "Materials", "VMC": "Materials", "FCX": "Materials", "NEM": "Materials",
+}
+
+_LEGACY_TSX_SECTORS = {
     "ABX.TO": "Precious Metals", "AEM.TO": "Precious Metals", "FNV.TO": "Precious Metals",
     "WPM.TO": "Precious Metals", "PAAS.TO": "Precious Metals", "AGI.TO": "Precious Metals",
-    # Energy & Uranium (5)
     "CNQ.TO": "Energy & Uranium", "SU.TO": "Energy & Uranium", "IMO.TO": "Energy & Uranium",
     "CVE.TO": "Energy & Uranium", "CCO.TO": "Energy & Uranium",
-    # Base Metals & Materials (3)
     "TECK-B.TO": "Base Metals & Materials", "RUS.TO": "Base Metals & Materials", "WFG.TO": "Base Metals & Materials",
-    # Technology (7)
     "SHOP.TO": "Technology", "CSU.TO": "Technology", "GIB-A.TO": "Technology",
     "CLS.TO": "Technology", "DSG.TO": "Technology", "KXS.TO": "Technology", "ENGH.TO": "Technology",
-    # Industrials & Rail (7)
     "CP.TO": "Industrials & Rail", "CNR.TO": "Industrials & Rail", "WCN.TO": "Industrials & Rail",
     "TIH.TO": "Industrials & Rail", "ATRL.TO": "Industrials & Rail", "STN.TO": "Industrials & Rail", "TFII.TO": "Industrials & Rail",
-    # Consumer & Packaging (4)
     "SAP.TO": "Consumer & Packaging", "ATZ.TO": "Consumer & Packaging",
     "CCL-B.TO": "Consumer & Packaging", "RCH.TO": "Consumer & Packaging",
 }
 
 
 def get_ticker_sector(ticker: str) -> str:
-    """Returns canonical sector classification for any Shariah-compliant TSX ticker."""
-    return SECTOR_MAP.get(normalize_ticker(ticker), "Other")
+    """Returns canonical sector classification for any Shariah-compliant ticker."""
+    norm = normalize_ticker(ticker)
+    return SECTOR_MAP.get(norm, _LEGACY_TSX_SECTORS.get(norm, "Other"))
 
 
 def normalize_ticker(ticker: str) -> str:
-    """Normalizes TSX dual-class tickers (e.g. TECK.B.TO or TECK.B -> TECK-B.TO)."""
+    """Normalizes US tickers (e.g. BRK.B -> BRK-B) while preserving explicit .TO suffixes."""
     t = ticker.strip().upper()
     if not t or t == "CASH":
         return t
-    base = t[:-3] if t.endswith(".TO") else t
-    return f"{base.replace('.', '-')}.TO"
+    if t.endswith(".TO"):
+        return f"{t[:-3].replace('.', '-')}.TO"
+    return t.replace(".", "-")
 
 
 def ticker_aliases(ticker: str) -> list[str]:
-    """Returns canonical hyphen and dot aliases for a TSX ticker."""
+    """Returns canonical hyphen and dot aliases for US or TSX tickers."""
     norm = normalize_ticker(ticker)
-    base_hyphen = norm[:-3] if norm.endswith(".TO") else norm
-    base_dot = base_hyphen.replace("-", ".")
-    return list(dict.fromkeys([norm, f"{base_dot}.TO", base_hyphen, base_dot, ticker.strip().upper()]))
+    if norm.endswith(".TO"):
+        base_hyphen = norm[:-3]
+        base_dot = base_hyphen.replace("-", ".")
+        return list(dict.fromkeys([norm, f"{base_dot}.TO", base_hyphen, base_dot, ticker.strip().upper()]))
+    base_dot = norm.replace("-", ".")
+    return list(dict.fromkeys([norm, base_dot, ticker.strip().upper()]))
 
 
 

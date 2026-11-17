@@ -196,13 +196,13 @@ def parse_bot_signals(bot_advice_text: str) -> List[Dict[str, Any]]:
             candidate = sell_match.group(1).upper()
             if candidate in ["ALERT", "TRIGGERS", "IMMEDIATE", "ACTION", "NOW"]:
                 continue
-            ticker = candidate if (candidate.endswith(".TO") or candidate.endswith("=F")) else f"{candidate}.TO"
+            ticker = candidate
             signals.append(
                 {"action": "SELL", "ticker": normalize_ticker(ticker), "signal_type": "SELL", "raw_line": cleaned}
             )
             continue
 
-        # 2. Match Buys: "1. BUY ATRL.TO", "BUY ATRL.TO", "SHOP.TO [REGULAR BUY]", "CCO.TO [CAPITULATION REVERSAL]"
+        # 2. Match Buys: "1. BUY NVDA", "BUY AAPL", "CRWD [REGULAR BUY]", "PAAS.TO [CAPITULATION REVERSAL]"
         buy_match_numbered = re.search(
             r"(?:^\d+[\.\)]\s*)BUY\s+([A-Z0-9\-\.]+)", cleaned, re.IGNORECASE
         )
@@ -214,16 +214,12 @@ def parse_bot_signals(bot_advice_text: str) -> List[Dict[str, Any]]:
 
         if buy_match_numbered:
             ticker = buy_match_numbered.group(1).upper()
-            if not ticker.endswith(".TO") and not ticker.endswith("=F"):
-                ticker += ".TO"
             signals.append(
                 {"action": "BUY", "ticker": normalize_ticker(ticker), "signal_type": "REGULAR", "raw_line": cleaned}
             )
         elif buy_match_bracket:
             ticker = buy_match_bracket.group(1).upper()
             sig_type = buy_match_bracket.group(2).upper()
-            if not ticker.endswith(".TO") and not ticker.endswith("=F"):
-                ticker += ".TO"
             signals.append(
                 {"action": "BUY", "ticker": normalize_ticker(ticker), "signal_type": sig_type, "raw_line": cleaned}
             )
@@ -449,7 +445,7 @@ def run_intraday_scan(bot_advice: str = ""):
             market_data, allowed_tickers, macro_state=macro_state, max_share_price=max_share_px, held_tickers=held_set
         )
         print(
-            f"Evaluated {len(market_data)}/{len(allowed_tickers)} Shariah-compliant TSX tickers -> "
+            f"Evaluated {len(market_data)}/{len(allowed_tickers)} Shariah-compliant US tickers -> "
             f"{len(signals)} actionable signal(s) (Macro: GC=F={'UP' if macro_state.get('GC=F', True) else 'DOWN'}, "
             f"CL=F={'UP' if macro_state.get('CL=F', True) else 'DOWN'}, "
             f"VIX={'PANIC' if macro_state.get('VIX_PANIC', False) else 'CALM'})."
@@ -556,7 +552,8 @@ def run_intraday_scan(bot_advice: str = ""):
             2,
         )
 
-    print(f"[MAPLE SCAN COMPLETE] Total Equity: ${total_equity:.2f} CAD\n")
+    acct_ccy = str(config.get("account_currency", "USD")).upper()
+    print(f"[MAPLE SCAN COMPLETE] Total Equity: ${total_equity:.2f} {acct_ccy}\n")
 
     # Dispatch Telegram interval update
     try:

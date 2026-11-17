@@ -53,8 +53,10 @@ def get_portfolio_nav(
     }
 
 
-def _get_tsx60_benchmark_return() -> Tuple[str, float]:
-    """Computes S&P/TSX 60 (XIU.TO) return since MAPLE's earliest recorded NAV date."""
+def _get_benchmark_return(account_currency: str = "USD") -> Tuple[str, str, float]:
+    """Computes S&P 500 (SPY) or S&P/TSX 60 (XIU.TO) return since MAPLE's earliest recorded NAV date."""
+    bench_sym = "XIU.TO" if account_currency.upper() == "CAD" else "SPY"
+    bench_lbl = "S&P/TSX 60 (XIU.TO)" if bench_sym == "XIU.TO" else "S&P 500 (SPY)"
     start_date = "2026-10-09"
     if os.path.exists(NAV_FILE):
         try:
@@ -65,15 +67,15 @@ def _get_tsx60_benchmark_return() -> Tuple[str, float]:
         except Exception:
             pass
     try:
-        hist = yf.Ticker("XIU.TO").history(start=start_date, timeout=10)
+        hist = yf.Ticker(bench_sym).history(start=start_date, timeout=10)
         if hist is not None and len(hist) >= 2:
             p0 = float(hist["Close"].iloc[0])
             p1 = float(hist["Close"].iloc[-1])
             if p0 > 0:
-                return start_date, round(((p1 - p0) / p0) * 100.0, 2)
+                return bench_lbl, start_date, round(((p1 - p0) / p0) * 100.0, 2)
     except Exception:
         pass
-    return start_date, 0.0
+    return bench_lbl, start_date, 0.0
 
 
 def generate_comparison_report() -> str:
@@ -113,16 +115,17 @@ def generate_comparison_report() -> str:
     maple_return = round(((maple_nav["nav"] - maple_baseline) / maple_baseline) * 100.0, 2) if maple_baseline > 0 else 0.0
     maple_twr = compute_twr_pct(maple_nav["nav"], config=maple_raw_cfg)
     target_90d = round(maple_baseline * 1.12, 2)
-    bench_date, tsx_return = _get_tsx60_benchmark_return()
+    acct_ccy = str(maple_raw_cfg.get("account_currency", "USD")).upper()
+    bench_lbl, bench_date, bench_return = _get_benchmark_return(acct_ccy)
 
     report = []
     report.append("+==================================================================+")
-    report.append("|  MAPLE vs S&P/TSX 60 (XIU.TO) -- PERFORMANCE BENCHMARK           |")
+    report.append(f"|  MAPLE vs {bench_lbl:<20s} -- PERFORMANCE BENCHMARK           |")
     report.append(f"|  Mode: {maple_raw.get('mode', 'SIMULATED'):<8} | Account: #{maple_raw.get('account_id', 'SIM'):<12} | Time: {now_str[:16]}  |")
     report.append("+------------------------------------------------------------------+")
     report.append(f"|  MAPLE Portfolio NAV:            ${maple_nav['nav']:<10.2f} ({maple_return:+.2f}% vs ${maple_baseline:,.0f} / TWR {maple_twr:+.2f}%) |")
     report.append(f"|  MAPLE Available Cash:           ${maple_nav['cash']:<10.2f}                      |")
-    report.append(f"|  S&P/TSX 60 (since {bench_date}):   {tsx_return:+.2f}%                          |")
+    report.append(f"|  {bench_lbl} (since {bench_date}): {bench_return:+.2f}%                          |")
     report.append("+------------------------------------------------------------------+")
     report.append("|  MAPLE Open Holdings:                                            |")
     if not maple_nav["details"]:
