@@ -784,7 +784,21 @@ def run_checks():
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    print("ALL 24 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 25. Nov 16 EOD Fixes: Trading-day (weekday) holding count across weekends & accrued dividend capital breakdown
+    assert maple_ledger._count_trading_days(
+        datetime.datetime(2026, 11, 13, 10, 1, 19),
+        datetime.datetime(2026, 11, 16, 16, 11, 4),
+    ) == 1, "Friday buy evaluated on Monday should be 1 trading day held, not 3 calendar days"
+    assert maple_ledger._count_trading_days(
+        datetime.datetime(2026, 11, 12, 10, 15, 45),
+        datetime.datetime(2026, 11, 16, 16, 11, 4),
+    ) == 2, "Thursday buy evaluated on Monday should be 2 trading days held, not 4 calendar days"
+    assert maple_ledger._count_trading_days(
+        datetime.datetime(2026, 11, 10, 11, 0, 41),
+        datetime.datetime(2026, 11, 16, 16, 11, 4),
+    ) == 4, "Tuesday buy evaluated next Monday should be 4 trading days held, not 6 calendar days"
+
+    print("ALL 25 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

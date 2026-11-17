@@ -285,7 +285,14 @@ def send_retrospective_report(
     else:
         daily_nav_str = "• <b>Daily NAV Change:</b> N/A (Baseline established today)"
 
-    market_val = equity - cash
+    stock_mv = (
+        round(sum(float(pa.get("market_value", 0.0)) for pa in position_attribution), 2)
+        if position_attribution
+        else round(equity - cash, 2)
+    )
+    accrued_div = round(equity - cash - stock_mv, 2)
+    market_val = stock_mv if accrued_div >= 0.50 else (equity - cash)
+    div_tag = f" | Accrued Div: CAD {accrued_div:.2f}" if accrued_div >= 0.50 else ""
 
     lines = [
         f"<b>MAPLE {period_label} ({now_str})</b>",
@@ -308,7 +315,7 @@ def send_retrospective_report(
         )
     lines.extend([
         f"• <b>Cumulative P&L (Inception):</b> {cum_sign}CAD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%{twr_tag})",
-        f"• <b>Capital Allocation:</b> Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {market_val:.2f} ({market_val/equity*100:.1f}%)",
+        f"• <b>Capital Allocation:</b> Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {market_val:.2f} ({market_val/equity*100:.1f}%){div_tag}",
     ])
 
     # 2. Today's Executions (BUYs & Realized SELLs)

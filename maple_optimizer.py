@@ -585,9 +585,16 @@ def run_daily_self_assessment():
         if has_contribs
         else f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}%) vs CAD {invested_capital:,.2f} seed"
     )
+    stock_mv = round(sum(float(pa.get("market_value", 0.0)) for pa in attribution), 2) if attribution else round(equity - cash, 2)
+    accrued_div = round(equity - cash - stock_mv, 2)
+    cap_line = (
+        f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {stock_mv:.2f} ({stock_mv/equity*100:.1f}%) | Accrued Div: CAD {accrued_div:.2f}"
+        if accrued_div >= 0.50
+        else f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {equity-cash:.2f} ({(equity-cash)/equity*100:.1f}%)"
+    )
     report.extend([
         cum_line,
-        f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {equity-cash:.2f} ({(equity-cash)/equity*100:.1f}%)",
+        cap_line,
     ])
 
     if sector_totals and equity > 0:

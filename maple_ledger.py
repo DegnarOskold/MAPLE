@@ -1301,8 +1301,23 @@ def sync_working_orders() -> Dict[str, Any]:
         return {}
 
 
+def _count_trading_days(start_dt: datetime.datetime, end_dt: datetime.datetime) -> int:
+    """Counts weekday (Mon-Fri) sessions elapsed between start_dt.date() and end_dt.date()."""
+    d0 = start_dt.date() if isinstance(start_dt, datetime.datetime) else start_dt
+    d1 = end_dt.date() if isinstance(end_dt, datetime.datetime) else end_dt
+    if d1 <= d0:
+        return 0
+    days = 0
+    cur = d0 + datetime.timedelta(days=1)
+    while cur <= d1:
+        if cur.weekday() < 5:
+            days += 1
+        cur += datetime.timedelta(days=1)
+    return days
+
+
 def get_position_holding_days(active_tickers: Optional[set] = None) -> Dict[str, int]:
-    """Reconstructs the number of calendar days each currently open position has been held."""
+    """Reconstructs the number of trading days (weekdays) each currently open position has been held."""
     if not os.path.exists(TRADES_FILE):
         return {}
 
@@ -1350,7 +1365,7 @@ def get_position_holding_days(active_tickers: Optional[set] = None) -> Dict[str,
 
     now = datetime.datetime.now()
     return {
-        t: max(0, (now - dt).days)
+        t: _count_trading_days(dt, now)
         for t, dt in first_buy_dates.items()
         if running_shares.get(t, 0.0) > 0.00001 and (allowed is None or t in allowed)
     }
