@@ -357,8 +357,8 @@ def run_checks():
             txt = f.read()
         assert "TSX-Trader" not in txt and "market_analyzer" not in txt, f"External dependency remained in {fname}!"
 
-    # 15. Oct 28 Retrospective Patches: TSX pre-MOC volume curve, whole-share round-up, max_share_price filter, unfiltered mover & fee audit
-    assert 0.28 <= maple_market._expected_intraday_vol_fraction(150.0) <= 0.30
+    # 15. Oct 28 / US Volume Curve: US pre-close volume curve (~38.8% at 150m), whole-share round-up, max_share_price filter, unfiltered mover & fee audit
+    assert 0.38 <= maple_market._expected_intraday_vol_fraction(150.0) <= 0.40
     assert maple_market._expected_intraday_vol_fraction(390.0) == 1.0
     assert maple_ledger._size_whole_shares("CNQ.TO", 226.98, 76.76, 0.0, 0.0, 947.23, 0.25, 400.0, 0.0, 0.35, 887.93, 0.30) == 3
     assert maple_ledger._size_whole_shares("CNQ.TO", 226.98, 76.76, 0.0, 0.0, 900.00, 0.25, 400.0, 0.0, 0.35, 887.93, 0.30) == 2
