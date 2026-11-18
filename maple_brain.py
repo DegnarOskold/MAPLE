@@ -287,7 +287,7 @@ def evaluate_autonomous_signals(
             and "Single-Bypass Rule" in rationale
         ):
             print(
-                f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - S&P 500 (SPY) below 50-SMA & falling (Single-Bypass gated)"
+                f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - S&P 500 (SPY) below 50-SMA (Single-Bypass gated)"
             )
             continue
 

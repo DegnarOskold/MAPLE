@@ -405,8 +405,8 @@ def get_macro_alignment() -> Dict[str, Any]:
         sh = yf.Ticker("SPY").history(period="3mo", timeout=8)
         if sh is not None and len(sh) >= 50:
             spy_sma50 = float(sh["Close"].tail(50).mean())
-            spy_cur, spy_prev = float(sh["Close"].iloc[-1]), float(sh["Close"].iloc[-2])
-            state["SPY_BELOW_SMA50"] = bool(spy_cur < spy_sma50 and spy_cur < spy_prev)
+            spy_cur = float(sh["Close"].iloc[-1])
+            state["SPY_BELOW_SMA50"] = bool(spy_cur < spy_sma50)
     except Exception:
         pass
     return state
