@@ -1,6 +1,6 @@
 """
 MAPLE Self-Contained Market Data, Technical Indicator & Macro Alignment Engine.
-Computes real-time TSX technicals, 24h-cached corporate calendars, and commodity macro alignment
+Computes real-time US equity technicals, 24h-cached corporate calendars, and commodity macro alignment
 locally within MAPLE with zero external folder dependencies.
 """
 
@@ -17,7 +17,7 @@ import yfinance as yf
 
 try:
     from zoneinfo import ZoneInfo
-    _ET_TZ = ZoneInfo("America/Toronto")
+    _ET_TZ = ZoneInfo("America/New_York")
 except Exception:
     _ET_TZ = None
 
@@ -233,7 +233,7 @@ def get_stock_data(
     mode: str = "SHORT",
     prefetched_hist: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Computes technical indicators and corporate event proximity for a TSX ticker."""
+    """Computes technical indicators and corporate event proximity for a US or TSX ticker."""
     try:
         ticker = yf.Ticker(ticker_symbol)
         req_cols = {"Open", "High", "Low", "Close", "Volume"}

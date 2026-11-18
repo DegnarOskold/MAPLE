@@ -1,7 +1,7 @@
 """
 Interactive Brokers Client Portal REST API Client for MAPLE
 Connects to the local Client Portal Gateway (https://localhost:5000)
-Handles account discovery, balance fetching, TSX contract resolution,
+Handles account discovery, balance fetching, US/TSX contract resolution,
 Level-1 quote fetching, and limit order placement with auto-confirmation.
 """
 
@@ -157,7 +157,7 @@ class IBKRClient:
         return positions
 
     def search_symbol(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """Resolves TSX ticker (e.g. CNR.TO, CNR, SHOP.TO) to IBKR Contract details with caching."""
+        """Resolves US or TSX ticker (e.g. NVDA, AAPL, BRK-B, or CNR.TO) to IBKR Contract details with caching."""
         cached = {}
         if os.path.exists(CACHE_FILE):
             try:

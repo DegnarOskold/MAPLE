@@ -1,7 +1,7 @@
 """
 MAPLE Standalone Daemon
 Allows MAPLE to run autonomously in the background even if Antigravity is closed.
-Loops every 30 minutes during TSX trading hours (9:30 AM - 4:00 PM ET Mon-Fri),
+Loops every 15 minutes during US market trading hours (9:30 AM - 4:00 PM ET Mon-Fri),
 executing real-time market scans, target/stop checking, and limit order placement.
 Executes the daily retrospective and self-optimization at 4:10 PM ET.
 """

@@ -1,9 +1,9 @@
 """
 MAPLE Brain Engine
 Orchestrates:
-1. Fetching live TSX technical indicators locally via maple_market + real-time IBKR Level-1 quotes
+1. Fetching live US equity technical indicators locally via maple_market + real-time IBKR Level-1 quotes
 2. Checking automated profit targets, opening-chop buffered stops, breakeven ratchets, and stagnation exits
-3. Autonomous 32-ticker candidate scanning across the Shariah-compliant TSX basket
+3. Autonomous 47-ticker candidate scanning across the Shariah-compliant US equity basket
 4. Enforcing macro commodity alignment, Shariah whitelist, sector/concentration caps, and circuit breakers
 5. Calculating dynamic tranche size (with small-account 1-share whole-lot floor up to 30% NAV)
 6. Executing real Limit Orders on IBKR (or paper trades in SIMULATED mode)
@@ -41,7 +41,7 @@ from maple_strategy import MapleStrategy
 
 
 def is_market_open() -> bool:
-    """Checks if Canadian TSX is in regular trading hours (09:30 - 16:00 EDT Mon-Fri)."""
+    """Checks if US equities (NYSE/NASDAQ) are in regular trading hours (09:30 - 16:00 ET Mon-Fri)."""
     now = datetime.datetime.now()
     if now.weekday() >= 5:  # Saturday or Sunday
         return False
@@ -51,7 +51,7 @@ def is_market_open() -> bool:
 
 
 def is_opening_chop() -> bool:
-    """Rule 3 Guard: Checks if TSX is in the volatile opening 30-min window (09:30 - 10:00 EDT)."""
+    """Rule 3 Guard: Checks if US equities are in the volatile opening 30-min window (09:30 - 10:00 ET)."""
     now = datetime.datetime.now()
     if now.weekday() >= 5:
         return False
@@ -70,7 +70,7 @@ def log_maple_advice(text: str):
 def fetch_latest_market_prices(
     tickers: List[str],
 ) -> Dict[str, Dict[str, Any]]:
-    """Retrieves local technical indicator data via maple_market and live TSX quotes from IBKR."""
+    """Retrieves local technical indicator data via maple_market and live quotes from IBKR."""
     data = {}
     config = load_config()
     is_live = config.get("trading_mode", "").upper() == "LIVE"
@@ -119,7 +119,7 @@ def fetch_latest_market_prices(
                 quotes = broker_client.get_quotes(list(ticker_to_cid.values()))
                 for t, cid in ticker_to_cid.items():
                     q = quotes.get(cid, {})
-                    # Never overwrite real-time yfinance TSX quotes with 15-min delayed IBKR snapshots ('6509': 'DB')
+                    # Never overwrite real-time yfinance quotes with 15-min delayed IBKR snapshots ('6509': 'DB')
                     if q.get("isDelayed", False) and (t in data or is_opening_chop()):
                         continue
                     last_p = q.get("lastTradePrice")
@@ -168,7 +168,7 @@ def fetch_latest_market_prices(
     if is_live and is_market_open():
         for t in [k for k, v in data.items() if v.get("Stale_Intraday")]:
             print(
-                f"[MAPLE STALE BAR GUARD] Skipping {t}: latest bar ({data[t].get('Bar_Date', 'prior session')}) predates today's TSX session."
+                f"[MAPLE STALE BAR GUARD] Skipping {t}: latest bar ({data[t].get('Bar_Date', 'prior session')}) predates today's market session."
             )
             del data[t]
 
@@ -234,7 +234,7 @@ def evaluate_autonomous_signals(
     max_share_price: Optional[float] = None,
     held_tickers: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
-    """Directly scans all 32 Shariah-compliant TSX tickers for Trend Momentum and Capitulation Reversal setups."""
+    """Directly scans all 47 Shariah-compliant US tickers for Trend Momentum and Capitulation Reversal setups."""
     MapleStrategy._sync_from_config()
     candidates = []
     held_norm = {normalize_ticker(t) for t in held_tickers} if held_tickers else set()
@@ -324,7 +324,7 @@ def run_chop_exit_guard() -> Dict[str, Any]:
     price_map = {}
     chop_mkt = {}
 
-    # Step 1: Fetch real-time TSX quotes via yfinance first
+    # Step 1: Fetch real-time US equity quotes via yfinance first
     for t in tickers:
         try:
             sd = get_stock_data(t, mode="SHORT")
@@ -407,7 +407,7 @@ def run_intraday_scan(bot_advice: str = ""):
 
     market_active = is_market_open()
     if not market_active and is_live:
-        print("[MAPLE NOTICE] TSX is currently outside regular trading hours (9:30 AM - 4:00 PM ET).")
+        print("[MAPLE NOTICE] US equity market is currently outside regular trading hours (9:30 AM - 4:00 PM ET).")
 
     # Step 1: Fetch live prices
     market_data = fetch_latest_market_prices(list(allowed_tickers))
@@ -425,7 +425,7 @@ def run_intraday_scan(bot_advice: str = ""):
         allow_stagnation_exit=(market_active or not is_live) and not is_opening_chop(),
     )
 
-    # Step 3: Evaluate autonomous 32-ticker candidate setups (or explicit CLI override text)
+    # Step 3: Evaluate autonomous 47-ticker candidate setups (or explicit CLI override text)
     # Refresh config & ledger_state after Step 2 exits so newly freed cash and closed positions are reflected in Step 3.
     config = load_config()
     ledger_state = get_ledger_state()
@@ -479,7 +479,7 @@ def run_intraday_scan(bot_advice: str = ""):
 
             elif action == "BUY":
                 if not market_active and is_live:
-                    print(f"[MAPLE NOTICE] Skipping live BUY order for {ticker}: TSX market closed.")
+                    print(f"[MAPLE NOTICE] Skipping live BUY order for {ticker}: US market closed.")
                     continue
 
                 if is_opening_chop() and is_live:

@@ -8,7 +8,7 @@ Objectives:
    - Realized trades and P&L from today's executions.
    - Position-by-position performance and drawdown attribution (identifies primary detractors and winners).
    - Risk audit on losing positions (distance to stop loss, volatility, position concentration).
-2. Retrospective analysis of screened 32-asset universe:
+2. Retrospective analysis of screened 47-asset US universe:
    - Distinguishes actionable missed setups from intentionally gated/rejected bounces.
 3. Quantitative risk & liquidity oversight:
    - Surfaces near-cap sector clustering, low deployable cash, and impending Day-4 stagnation exits.
@@ -413,7 +413,7 @@ def run_daily_self_assessment():
     equity = float(state.get("total_equity", cash))
     positions = state.get("positions", {})
 
-    # Compute 32-ticker equal-weight benchmark; preserve authoritative live broker marks when verified
+    # Compute equal-weight universe benchmark; preserve authoritative live broker marks when verified
     live_authoritative = is_live and bool(state.get("live_verified", False)) and equity > 0
     norm_allowed = [normalize_ticker(t) for t in allowed_tickers]
     prefetched = prefetch_histories(norm_allowed) if len(norm_allowed) > 1 else {}
@@ -577,7 +577,7 @@ def run_daily_self_assessment():
         )
     if basket_pct is not None and prev_equity:
         report.append(
-            f"**Universe Benchmark (32 TSX Equal-Wt):** {basket_pct:+.2f}% | **Relative Alpha:** {daily_pct - basket_pct:+.2f}%"
+            f"**Universe Benchmark ({len(norm_allowed)} US Equal-Wt):** {basket_pct:+.2f}% | **Relative Alpha:** {daily_pct - basket_pct:+.2f}%"
         )
     has_contribs = abs(invested_capital - float(config.get("initial_cash", 1000.0))) >= 1.0
     cum_line = (

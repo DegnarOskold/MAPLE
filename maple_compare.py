@@ -1,6 +1,6 @@
 """
 MAPLE Comparison Engine
-Benchmarks MAPLE's live/simulated portfolio performance against the S&P/TSX 60 Index ETF (XIU.TO)
+Benchmarks MAPLE's live/simulated portfolio performance against the S&P 500 ETF (SPY) or S&P/TSX 60 (XIU.TO)
 and evaluates progress towards the +12% per 90-day target using only local MAPLE resources.
 Supports both LIVE IBKR account and SIMULATED modes.
 """

@@ -139,7 +139,7 @@ def send_trade_alert(
     lines = []
     if action_upper == "BUY":
         lines.append("<b>TRADE EXECUTION: BUY</b> 🟢")
-        lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (TSX)")
+        lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (US)")
         lines.append(f"• <b>Order:</b> {shares:g} shares @ Limit CAD {price:.2f}")
         lines.append(f"• <b>Capital Committed:</b> CAD {shares * price:.2f}")
         lines.append(f"• <b>IBKR Order ID:</b> <code>#{order_id}</code>")
@@ -155,7 +155,7 @@ def send_trade_alert(
 
     elif action_upper == "SELL":
         lines.append("<b>TRADE EXECUTION: SELL (FILLED)</b> 🔴")
-        lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (TSX)")
+        lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (US)")
         lines.append(f"• <b>Order:</b> {shares:g} shares @ CAD {price:.2f}")
         lines.append(f"• <b>Gross Proceeds:</b> CAD {shares * price:.2f}")
         lines.append(f"• <b>IBKR Order ID:</b> <code>#{order_id}</code>")
@@ -168,8 +168,8 @@ def send_trade_alert(
             lines.append(f"• <b>Exit Reason:</b> <i>{clean_notes}</i>")
 
     elif action_upper in ["ORDER_SUBMITTED", "WORKING", "SUBMITTED"]:
-        lines.append("<b>ORDER SUBMITTED TO TSX BOOK</b> 🟡")
-        lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (TSX)")
+        lines.append("<b>ORDER SUBMITTED TO BROKER</b> 🟡")
+        lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (US)")
         lines.append(f"• <b>Order:</b> {shares:g} shares @ Limit CAD {price:.2f} (Marketable Limit)")
         lines.append(f"• <b>Status:</b> Working on book | Awaiting broker fill confirmation")
         lines.append(f"• <b>IBKR Order ID:</b> <code>#{order_id}</code>")
@@ -311,7 +311,7 @@ def send_retrospective_report(
         )
     if basket_pct is not None and prev_equity and prev_equity > 0:
         lines.append(
-            f"• <b>32-Ticker Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
+            f"• <b>47-Ticker US Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
         )
     lines.extend([
         f"• <b>Cumulative P&L (Inception):</b> {cum_sign}CAD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%{twr_tag})",
@@ -468,7 +468,7 @@ def test_telegram_connection() -> bool:
     test_msg = (
         "<b>MAPLE Autonomous Trading Bot Connected</b>\n\n"
         "• Real-time trade execution alerts\n"
-        "• 15-minute TSX market scan updates\n"
+        "• 15-minute US market scan updates\n"
         "• Daily closing NAV & performance attribution reports\n\n"
         "<i>Interactive Brokers Canada autonomous connection initialized</i>"
     )

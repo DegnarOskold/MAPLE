@@ -857,7 +857,7 @@ def execute_buy(
                     "cash_balance": rem_cash,
                 }
             else:
-                print(f"[MAPLE LIVE WORKING ORDER] Limit Buy #{order_id} active on TSX book ({order_status}, fills: {cum_fill}/{shares} shs).")
+                print(f"[MAPLE LIVE WORKING ORDER] Limit Buy #{order_id} active on IBKR book ({order_status}, fills: {cum_fill}/{shares} shs).")
                 if "pending_orders" not in config:
                     config["pending_orders"] = {}
                 est_blended = ((existing_shares * existing_acb) + (shares * limit_price)) / (existing_shares + shares) if existing_shares > 0 else limit_price
@@ -885,7 +885,7 @@ def execute_buy(
                         shares=shares,
                         price=limit_price,
                         order_id=order_id,
-                        notes=f"Resting limit buy on TSX book ({notes})"
+                        notes=f"Resting limit buy on IBKR book ({notes})"
                     )
                 except Exception:
                     pass
@@ -1130,7 +1130,7 @@ def execute_sell(
                 }
             else:
                 acb = float(pos.get("averageEntryPrice", current_price))
-                print(f"[MAPLE LIVE WORKING ORDER] Limit Sell #{order_id} active on TSX book ({order_status}, fills: {cum_fill}/{shares} shs). Position retained until filled.")
+                print(f"[MAPLE LIVE WORKING ORDER] Limit Sell #{order_id} active on IBKR book ({order_status}, fills: {cum_fill}/{shares} shs). Position retained until filled.")
                 if "pending_orders" not in config:
                     config["pending_orders"] = {}
                 config["pending_orders"][ticker] = {
@@ -1154,7 +1154,7 @@ def execute_sell(
                         shares=shares,
                         price=limit_price,
                         order_id=order_id,
-                        notes=f"Resting marketable limit sell on TSX book ({reason})"
+                        notes=f"Resting marketable limit sell on IBKR book ({reason})"
                     )
                 except Exception:
                     pass
@@ -1321,7 +1321,7 @@ def sync_working_orders() -> Dict[str, Any]:
                         order_id=order_id,
                         pnl=pnl,
                         pnl_pct=pnl_pct,
-                        notes=f"FILLED on TSX book: {reason}"
+                        notes=f"FILLED on IBKR book: {reason}"
                     )
                 except Exception:
                     pass
