@@ -38,10 +38,11 @@ MAPLE/
 ├── maple_optimizer.py           # Daily post-close performance audit, attribution, changelog logging
 ├── maple_daemon.py              # Standalone continuous background loop
 ├── maple_compare.py             # Benchmarks MAPLE performance against S&P 500 (SPY)
+├── maple_backtest.py            # Read-only 1-year US walk-forward backtester CLI
 ├── ibkr_client.py               # Interactive Brokers Client Portal Gateway REST API client (SMART/USD)
 ├── ibkr_keepalive.py            # Gateway SSO session keepalive daemon (45s tickle)
 ├── telegram_notifier.py         # Telegram notification dispatcher
-├── test_risk_guards.py          # 27-point regression self-check test suite
+├── test_risk_guards.py          # 28-point regression self-check test suite
 ├── start_ibkr_gateway.bat       # Windows launcher for local IBKR Client Portal Gateway
 ├── run_maple.bat                # Windows launcher for MAPLE continuous daemon
 ├── requirements.txt             # Python package dependencies
@@ -138,7 +139,7 @@ Open `maple_config.json` in your text editor and customize:
 
 ## Verifying the Test Suite
 
-Before running live capital, verify that all 27 mathematical risk guards, filters, and standalone decoupling checks pass:
+Before running live capital, verify that all 28 mathematical risk guards, filters, and standalone decoupling checks pass:
 
 ```bash
 python test_risk_guards.py
@@ -146,7 +147,7 @@ python test_risk_guards.py
 
 Expected output:
 ```
-ALL 27 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!
+ALL 28 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!
 ```
 
 ---

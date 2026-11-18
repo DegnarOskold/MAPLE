@@ -280,8 +280,25 @@ def evaluate_autonomous_signals(
             print(f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - {macro_reason}")
             continue
 
+        if (
+            macro_state
+            and macro_state.get("SPY_BELOW_SMA50", False)
+            and cand_type != "CAPITULATION REVERSAL"
+            and "Single-Bypass Rule" in rationale
+        ):
+            print(
+                f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - S&P 500 (SPY) below 50-SMA & falling (Single-Bypass gated)"
+            )
+            continue
+
         vr_val = float(vol_ratio) if isinstance(vol_ratio, (int, float)) else 0.0
         adx_val = float(sd.get("ADX_14")) if isinstance(sd.get("ADX_14"), (int, float)) else 0.0
+        ret_20d = sd.get("Ret_20d")
+        rank_tuple = (
+            (tranche_pct, round(vr_val, 2), float(ret_20d), adx_val)
+            if isinstance(ret_20d, (int, float))
+            else (tranche_pct, vr_val, adx_val)
+        )
         candidates.append(
             {
                 "action": "BUY",
@@ -289,7 +306,7 @@ def evaluate_autonomous_signals(
                 "signal_type": cand_type,
                 "tranche_pct": tranche_pct,
                 "rationale": rationale,
-                "_rank": (tranche_pct, vr_val, adx_val),
+                "_rank": rank_tuple,
             }
         )
 

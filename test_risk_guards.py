@@ -834,7 +834,30 @@ def run_checks():
     assert maple_market.is_macro_aligned("NEM", {"GC=F": False, "CL=F": True, "VIX_PANIC": True})[0] is False
     assert maple_market.is_macro_aligned("XOM", {"GC=F": False, "CL=F": True, "VIX_PANIC": True})[0] is True
 
-    print("ALL 27 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 28. Strategy Review Upgrades: SMA_50 primary trend gate, clamped ATR stop [3.25%, 5.0%], Ret_20d + SPY<SMA50 filter, and maple_backtest
+    sma50_block, sma50_r = MapleStrategy.calculate_tranche_size(
+        {"Price": 140.0, "Open": 138.0, "EMA_5": 139.0, "EMA_9": 137.5, "SMA_50": 148.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.4, "ADX_14": 25.0, "RSI_7": 55.0},
+        signal_type="REGULAR BUY",
+    )
+    assert sma50_block == 0.0 and "Primary Trend Gate" in sma50_r, f"Below-SMA50 trend buy was not blocked: {sma50_block}, {sma50_r}"
+
+    _, low_vol_stp = MapleStrategy.calculate_targets(100.0, {"ATR_5": 1.10, "BB_Mid": 104.0}, shares=10.0, cost_basis=100.0)
+    assert low_vol_stp == 96.75, f"Low-volatility ATR stop should clamp to -3.25% ($96.75), got {low_vol_stp}"
+
+    rank_mkt = {
+        "AAPL": {"Price": 350.0, "Open": 345.0, "EMA_5": 348.0, "EMA_9": 344.0, "SMA_50": 330.0, "Ret_20d": 2.5, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.50, "ADX_14": 30.0, "RSI_7": 55.0},
+        "NVDA": {"Price": 155.0, "Open": 152.0, "EMA_5": 154.0, "EMA_9": 151.0, "SMA_50": 140.0, "Ret_20d": 11.2, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.50, "ADX_14": 29.0, "RSI_7": 55.0},
+        "TXN": {"Price": 295.0, "Open": 292.0, "EMA_5": 294.0, "EMA_9": 291.0, "SMA_50": 285.0, "Ret_20d": 4.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.60, "ADX_14": 17.5, "RSI_7": 55.0},
+    }
+    ranked_sigs = maple_brain.evaluate_autonomous_signals(
+        rank_mkt, {"AAPL", "NVDA", "TXN"}, macro_state={"GC=F": True, "CL=F": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": True}
+    )
+    assert [s["ticker"] for s in ranked_sigs] == ["NVDA", "AAPL"], f"Ret_20d tie-breaker or SPY_BELOW_SMA50 single-bypass filter failed: {ranked_sigs}"
+
+    import maple_backtest
+    assert callable(maple_backtest.run_backtest) and maple_backtest.run_backtest({})["trades"] == 0
+
+    print("ALL 28 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

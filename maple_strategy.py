@@ -43,6 +43,8 @@ class MapleStrategy:
 
     # Stop Loss & Profit Target Heuristics
     STOP_LOSS_PCT = 5.0
+    MIN_STOP_LOSS_PCT = 3.25
+    ATR_STOP_MULTIPLIER = 2.2
     HALF_RISK_TRIGGER_PCT = 2.0
     BREAKEVEN_TRIGGER_PCT = 2.5
     CAPITULATION_TARGET_PCT = 3.5
@@ -148,6 +150,11 @@ class MapleStrategy:
                 ema5_ext_pct = ((price - ema_5) / ema_5) * 100.0
                 if ema5_ext_pct > cls.MAX_EMA5_EXTENSION_PCT:
                     return 0.0, f"BLOCKED by Overextension Cap (Flaw 5): Live Price (${price:.2f}) is +{ema5_ext_pct:.2f}% above EMA_5 (${ema_5:.2f}), exceeding {cls.MAX_EMA5_EXTENSION_PCT:.1f}% limit"
+
+            # Gate B2: Primary Uptrend Gate (require Price >= SMA_50 on non-capitulation trend entries)
+            sma_50 = stock_data.get("SMA_50")
+            if isinstance(price, (int, float)) and isinstance(sma_50, (int, float)) and sma_50 > 0 and price < sma_50:
+                return 0.0, f"BLOCKED by Primary Trend Gate: Live Price (${price:.2f}) is below SMA_50 (${sma_50:.2f})"
 
             # Gate C: Hard Overbought Ceiling & Single-Bypass Limit (Flaw 4)
             if isinstance(rsi, (int, float)) and rsi > cls.RSI_OVERBOUGHT_LIMIT:
@@ -270,7 +277,11 @@ class MapleStrategy:
             isinstance(rsi, (int, float)) and rsi < cls.RSI_OVERSOLD_MAX
         )
 
-        stop_loss = round(base_price * (1.0 - cls.STOP_LOSS_PCT / 100.0), 2)
+        eff_stop_pct = cls.STOP_LOSS_PCT
+        if isinstance(atr, (int, float)) and atr > 0 and base_price > 0:
+            atr_stop_pct = ((float(atr) * cls.ATR_STOP_MULTIPLIER) / base_price) * 100.0
+            eff_stop_pct = max(cls.MIN_STOP_LOSS_PCT, min(cls.STOP_LOSS_PCT, atr_stop_pct))
+        stop_loss = round(base_price * (1.0 - eff_stop_pct / 100.0), 2)
 
         # 2. Ex-Dividend Adjustment: Account for mechanical price drop if ex-date is within 3 days
         days_to_ex_div = stock_data.get("days_to_ex_dividend")

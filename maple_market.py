@@ -295,6 +295,12 @@ def get_stock_data(
             dmp_14 = float(latest["DMP_14"]) if "DMP_14" in latest and pd.notna(latest["DMP_14"]) else 0.0
             dmn_14 = float(latest["DMN_14"]) if "DMN_14" in latest and pd.notna(latest["DMN_14"]) else 0.0
             sma_50 = float(latest["SMA_50"]) if "SMA_50" in latest and pd.notna(latest["SMA_50"]) else 0.0
+            if len(hist) >= 21 and float(hist["Close"].iloc[-21]) > 0:
+                ret_20d = round(((price - float(hist["Close"].iloc[-21])) / float(hist["Close"].iloc[-21])) * 100.0, 2)
+            elif len(hist) >= 2 and float(hist["Close"].iloc[0]) > 0:
+                ret_20d = round(((price - float(hist["Close"].iloc[0])) / float(hist["Close"].iloc[0])) * 100.0, 2)
+            else:
+                ret_20d = 0.0
 
             if ema_5 > ema_9 and ema_5 > 0:
                 sma50_ceiling = sma_50 > 0 and ema_9 < sma_50 and abs(price - sma_50) / sma_50 <= 0.015
@@ -334,6 +340,8 @@ def get_stock_data(
                 "EMA_Crossover": crossover,
                 "EMA_5": round(ema_5, 2) if ema_5 > 0 else "N/A",
                 "EMA_9": round(ema_9, 2) if ema_9 > 0 else "N/A",
+                "SMA_50": round(sma_50, 2) if sma_50 > 0 else "N/A",
+                "Ret_20d": ret_20d,
                 "RSI_7": round(float(latest["RSI_7"]), 2) if "RSI_7" in latest and pd.notna(latest["RSI_7"]) else "N/A",
                 "ATR_5": round(float(latest["ATRr_5"]), 2) if "ATRr_5" in latest and pd.notna(latest["ATRr_5"]) else "N/A",
                 "ADX_14": round(float(latest["ADX_14"]), 2) if "ADX_14" in latest and pd.notna(latest["ADX_14"]) else "N/A",
@@ -377,8 +385,8 @@ def get_stock_data(
 
 
 def get_macro_alignment() -> Dict[str, Any]:
-    """Checks intraday/daily directional alignment for Gold (GC=F), Crude Oil (CL=F), and VIX panic regime (^VIX)."""
-    state: Dict[str, Any] = {"GC=F": True, "CL=F": True, "VIX_PANIC": False}
+    """Checks intraday/daily directional alignment for Gold (GC=F), Crude Oil (CL=F), VIX panic (^VIX), and S&P 500 trend (SPY)."""
+    state: Dict[str, Any] = {"GC=F": True, "CL=F": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
     for sym in ("GC=F", "CL=F"):
         try:
             hist = yf.Ticker(sym).history(period="5d", timeout=8)
@@ -387,11 +395,19 @@ def get_macro_alignment() -> Dict[str, Any]:
         except Exception:
             pass
     try:
-        # ponytail: VIX >= 25 or +10% day spike proxy for broad-market panic; add ^GSPTSE breadth only if TSX diverges from US VIX
+        # ponytail: VIX >= 25 or +10% day spike proxy for broad-market panic
         vh = yf.Ticker("^VIX").history(period="5d", timeout=8)
         if vh is not None and len(vh) >= 2:
             v_cur, v_prev = float(vh["Close"].iloc[-1]), float(vh["Close"].iloc[-2])
             state["VIX_PANIC"] = v_cur >= 25.0 or (v_prev > 0 and ((v_cur - v_prev) / v_prev) >= 0.10)
+    except Exception:
+        pass
+    try:
+        sh = yf.Ticker("SPY").history(period="3mo", timeout=8)
+        if sh is not None and len(sh) >= 50:
+            spy_sma50 = float(sh["Close"].tail(50).mean())
+            spy_cur, spy_prev = float(sh["Close"].iloc[-1]), float(sh["Close"].iloc[-2])
+            state["SPY_BELOW_SMA50"] = bool(spy_cur < spy_sma50 and spy_cur < spy_prev)
     except Exception:
         pass
     return state
