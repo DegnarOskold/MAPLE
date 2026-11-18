@@ -140,15 +140,15 @@ def send_trade_alert(
     if action_upper == "BUY":
         lines.append("<b>TRADE EXECUTION: BUY</b> 🟢")
         lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (US)")
-        lines.append(f"• <b>Order:</b> {shares:g} shares @ Limit CAD {price:.2f}")
-        lines.append(f"• <b>Capital Committed:</b> CAD {shares * price:.2f}")
+        lines.append(f"• <b>Order:</b> {shares:g} shares @ Limit USD {price:.2f}")
+        lines.append(f"• <b>Capital Committed:</b> USD {shares * price:.2f}")
         lines.append(f"• <b>IBKR Order ID:</b> <code>#{order_id}</code>")
         if target_price:
             gain_pct = ((target_price - price) / price) * 100 if price > 0 else 0
-            lines.append(f"• <b>Profit Target:</b> CAD {target_price:.2f} (+{gain_pct:.1f}%)")
+            lines.append(f"• <b>Profit Target:</b> USD {target_price:.2f} (+{gain_pct:.1f}%)")
         if stop_loss_price:
             loss_pct = ((price - stop_loss_price) / price) * 100 if price > 0 else 0
-            lines.append(f"• <b>Stop Loss:</b> CAD {stop_loss_price:.2f} (-{loss_pct:.1f}%)")
+            lines.append(f"• <b>Stop Loss:</b> USD {stop_loss_price:.2f} (-{loss_pct:.1f}%)")
         if notes:
             clean_notes = str(notes).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             lines.append(f"• <b>Rationale:</b> <i>{clean_notes}</i>")
@@ -156,13 +156,13 @@ def send_trade_alert(
     elif action_upper == "SELL":
         lines.append("<b>TRADE EXECUTION: SELL (FILLED)</b> 🔴")
         lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (US)")
-        lines.append(f"• <b>Order:</b> {shares:g} shares @ CAD {price:.2f}")
-        lines.append(f"• <b>Gross Proceeds:</b> CAD {shares * price:.2f}")
+        lines.append(f"• <b>Order:</b> {shares:g} shares @ USD {price:.2f}")
+        lines.append(f"• <b>Gross Proceeds:</b> USD {shares * price:.2f}")
         lines.append(f"• <b>IBKR Order ID:</b> <code>#{order_id}</code>")
         if pnl is not None and pnl_pct is not None:
             sign = "+" if pnl >= 0 else ""
             pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-            lines.append(f"• <b>Realized P&L:</b> {pnl_emoji} {sign}CAD {pnl:.2f} ({sign}{pnl_pct:.2f}%)")
+            lines.append(f"• <b>Realized P&L:</b> {pnl_emoji} {sign}USD {pnl:.2f} ({sign}{pnl_pct:.2f}%)")
         if notes:
             clean_notes = str(notes).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             lines.append(f"• <b>Exit Reason:</b> <i>{clean_notes}</i>")
@@ -170,7 +170,7 @@ def send_trade_alert(
     elif action_upper in ["ORDER_SUBMITTED", "WORKING", "SUBMITTED"]:
         lines.append("<b>ORDER SUBMITTED TO BROKER</b> 🟡")
         lines.append(f"• <b>Symbol:</b> <code>{ticker}</code> (US)")
-        lines.append(f"• <b>Order:</b> {shares:g} shares @ Limit CAD {price:.2f} (Marketable Limit)")
+        lines.append(f"• <b>Order:</b> {shares:g} shares @ Limit USD {price:.2f} (Marketable Limit)")
         lines.append(f"• <b>Status:</b> Working on book | Awaiting broker fill confirmation")
         lines.append(f"• <b>IBKR Order ID:</b> <code>#{order_id}</code>")
         if notes:
@@ -203,8 +203,8 @@ def send_scan_update(
     lines = [
         f"<b>MAPLE Scan Update ({now_str} ET)</b>",
         f"• <b>Desk Status:</b> {action_taken}",
-        f"• <b>Portfolio NAV:</b> CAD {total_equity:.2f} ({cum_sign}{cum_return:.2f}% vs CAD {base_cap:,.0f} invested)",
-        f"• <b>Available Cash:</b> CAD {cash:.2f}",
+        f"• <b>Portfolio NAV:</b> USD {total_equity:.2f} ({cum_sign}{cum_return:.2f}% vs USD {base_cap:,.0f} invested)",
+        f"• <b>Available Cash:</b> USD {cash:.2f}",
     ]
 
     if positions:
@@ -223,8 +223,8 @@ def send_scan_update(
             tgt_str = f" | Tgt: {tgt:.2f}" if tgt else ""
             stp_str = f" | Stp: {stp:.2f}" if stp else ""
             lines.append(
-                f"• <code>{sym}</code>: {shs:g} shs @ CAD {cur_p:.2f} "
-                f"({pnl_sign}CAD {pos_pnl:.2f} / {pnl_sign}{pos_pnl_pct:.1f}%){tgt_str}{stp_str}"
+                f"• <code>{sym}</code>: {shs:g} shs @ USD {cur_p:.2f} "
+                f"({pnl_sign}USD {pos_pnl:.2f} / {pnl_sign}{pos_pnl_pct:.1f}%){tgt_str}{stp_str}"
             )
     else:
         lines.append("\n• <b>Holdings:</b> 100% Cash")
@@ -281,7 +281,7 @@ def send_retrospective_report(
         daily_pnl = equity - prev_equity
         daily_pct = (daily_pnl / prev_equity) * 100
         daily_sign = "+" if daily_pnl >= 0 else ""
-        daily_nav_str = f"• <b>Daily NAV Change:</b> {daily_sign}CAD {daily_pnl:.2f} ({daily_sign}{daily_pct:.2f}% today)"
+        daily_nav_str = f"• <b>Daily NAV Change:</b> {daily_sign}USD {daily_pnl:.2f} ({daily_sign}{daily_pct:.2f}% today)"
     else:
         daily_nav_str = "• <b>Daily NAV Change:</b> N/A (Baseline established today)"
 
@@ -292,12 +292,12 @@ def send_retrospective_report(
     )
     accrued_div = round(equity - cash - stock_mv, 2)
     market_val = stock_mv if accrued_div >= 0.50 else (equity - cash)
-    div_tag = f" | Accrued Div: CAD {accrued_div:.2f}" if accrued_div >= 0.50 else ""
+    div_tag = f" | Accrued Div: USD {accrued_div:.2f}" if accrued_div >= 0.50 else ""
 
     lines = [
         f"<b>MAPLE {period_label} ({now_str})</b>",
         "\n<b>1. Portfolio NAV & Capital Summary:</b>",
-        f"• <b>Closing Equity NAV:</b> <b>CAD {equity:.2f}</b>",
+        f"• <b>Closing Equity NAV:</b> <b>USD {equity:.2f}</b>",
         daily_nav_str,
     ]
     if weekly_summary:
@@ -306,16 +306,16 @@ def send_retrospective_report(
         r_pnl = float(weekly_summary.get("net_realized_pnl", 0.0))
         lines.append(
             f"• <b>Weekly NAV Change (vs {weekly_summary.get('base_date', 'Prior Fri')}):</b> "
-            f"{w_pnl:+.2f} CAD ({w_pct:+.2f}% WoW) | Realized: "
-            f"{weekly_summary.get('wins', 0)}W/{weekly_summary.get('losses', 0)}L ({r_pnl:+.2f} CAD)"
+            f"{w_pnl:+.2f} USD ({w_pct:+.2f}% WoW) | Realized: "
+            f"{weekly_summary.get('wins', 0)}W/{weekly_summary.get('losses', 0)}L ({r_pnl:+.2f} USD)"
         )
     if basket_pct is not None and prev_equity and prev_equity > 0:
         lines.append(
             f"• <b>47-Ticker US Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
         )
     lines.extend([
-        f"• <b>Cumulative P&L (Inception):</b> {cum_sign}CAD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%{twr_tag})",
-        f"• <b>Capital Allocation:</b> Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {market_val:.2f} ({market_val/equity*100:.1f}%){div_tag}",
+        f"• <b>Cumulative P&L (Inception):</b> {cum_sign}USD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%{twr_tag})",
+        f"• <b>Capital Allocation:</b> Cash: USD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: USD {market_val:.2f} ({market_val/equity*100:.1f}%){div_tag}",
     ])
 
     # 2. Today's Executions (BUYs & Realized SELLs)
@@ -323,7 +323,7 @@ def send_retrospective_report(
         lines.append("\n<b>2. Today's Executions:</b>")
         for bt in (buy_trades or []):
             lines.append(
-                f"• <code>{bt.get('ticker', 'N/A')}</code> BUY {bt.get('quantity', 0):g} shs @ CAD {bt.get('price', 0.0):.2f} "
+                f"• <code>{bt.get('ticker', 'N/A')}</code> BUY {bt.get('quantity', 0):g} shs @ USD {bt.get('price', 0.0):.2f} "
                 f"<i>[{html.escape(str(bt.get('bucket', 'Regular Trend')))}]</i>"
             )
         for rt in (realized_trades or []):
@@ -336,8 +336,8 @@ def send_retrospective_report(
             pnl_str = ""
             if pnl_val is not None:
                 p_sign = "+" if pnl_val >= 0 else ""
-                pnl_str = f" | Realized P&L: {p_sign}CAD {pnl_val:.2f} ({p_sign}{pnl_pct_val:.1f}%)"
-            lines.append(f"• <code>{sym}</code> {act} {qty:g} shs @ CAD {px:.2f}{pnl_str}")
+                pnl_str = f" | Realized P&L: {p_sign}USD {pnl_val:.2f} ({p_sign}{pnl_pct_val:.1f}%)"
+            lines.append(f"• <code>{sym}</code> {act} {qty:g} shs @ USD {px:.2f}{pnl_str}")
     else:
         lines.append("\n<b>2. Today's Executions:</b> None (No trades executed)")
 
@@ -359,8 +359,8 @@ def send_retrospective_report(
                 else ""
             )
             lines.append(
-                f"• <code>{sym}</code> ({weight:.1f}% port): {shs:g} shs @ CAD {cur_p:.2f} (ACB: {acb:.2f}) "
-                f"| P&L: <b>{sign}CAD {unrealized:.2f} ({sign}{unrealized_pct:.2f}%)</b>{fee_str}"
+                f"• <code>{sym}</code> ({weight:.1f}% port): {shs:g} shs @ USD {cur_p:.2f} (ACB: {acb:.2f}) "
+                f"| P&L: <b>{sign}USD {unrealized:.2f} ({sign}{unrealized_pct:.2f}%)</b>{fee_str}"
             )
     elif positions:
         lines.append("\n<b>3. Active Positions:</b>")
@@ -373,7 +373,7 @@ def send_retrospective_report(
             unrealized = (cur_p - acb) * shs
             unrealized_pct = ((cur_p - acb) / acb * 100) if acb > 0 else 0
             sign = "+" if unrealized >= 0 else ""
-            lines.append(f"• <code>{sym}</code>: {shs:g} shs @ CAD {cur_p:.2f} | P&L: {sign}CAD {unrealized:.2f} ({sign}{unrealized_pct:.1f}%)")
+            lines.append(f"• <code>{sym}</code>: {shs:g} shs @ USD {cur_p:.2f} | P&L: {sign}USD {unrealized:.2f} ({sign}{unrealized_pct:.1f}%)")
 
     # 4. Risk Watchlist & Stop-Loss Proximity
     if risk_watchlist:
@@ -386,8 +386,8 @@ def send_retrospective_report(
             dist_pct = rw["distance_to_stop_pct"]
             drawdown_note = rw.get("note", "")
             lines.append(
-                f"• ⚠️ <code>{sym}</code>: Current CAD {cur_px:.2f} vs Stop CAD {stop_px:.2f} "
-                f"(Buffer: CAD {dist_cad:.2f} / {dist_pct:.1f}% to stop). {drawdown_note}"
+                f"• ⚠️ <code>{sym}</code>: Current USD {cur_px:.2f} vs Stop USD {stop_px:.2f} "
+                f"(Buffer: USD {dist_cad:.2f} / {dist_pct:.1f}% to stop). {drawdown_note}"
             )
     else:
         lines.append("\n<b>4. Risk Watchlist:</b> All positions maintain >3.0% buffer above stop-loss thresholds.")

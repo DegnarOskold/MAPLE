@@ -504,7 +504,7 @@ def run_daily_self_assessment():
     audit_flags = []
     if abs(day_flows) >= 1.0:
         audit_flags.append(
-            f"[CAPITAL FLOW] Settled external cash flow CAD {day_flows:+.2f} today; Daily/Weekly/TWR returns cash-flow adjusted."
+            f"[CAPITAL FLOW] Settled external cash flow USD {day_flows:+.2f} today; Daily/Weekly/TWR returns cash-flow adjusted."
         )
 
     for sym in held_syms:
@@ -530,13 +530,13 @@ def run_daily_self_assessment():
     low_cash_floor = max(eff_min_trade, equity * 0.10) if equity > 0 else eff_min_trade
     if equity > 0 and cash < low_cash_floor:
         audit_flags.append(
-            f"[LIQUIDITY WATCH] Deployable cash at CAD {cash:.2f} ({cash/equity*100:.1f}% of NAV; below CAD {low_cash_floor:.2f} 10% / min-trade buffer)."
+            f"[LIQUIDITY WATCH] Deployable cash at USD {cash:.2f} ({cash/equity*100:.1f}% of NAV; below USD {low_cash_floor:.2f} 10% / min-trade buffer)."
         )
 
     if daily_pct <= -1.5:
-        worst_str = f" (primary open detractor: {attribution[0]['ticker']} CAD {attribution[0]['unrealized_pnl']:+.2f})" if attribution else ""
+        worst_str = f" (primary open detractor: {attribution[0]['ticker']} USD {attribution[0]['unrealized_pnl']:+.2f})" if attribution else ""
         audit_flags.append(
-            f"[DRAWDOWN AUDIT] Daily NAV delta {daily_pct:+.2f}% (CAD {daily_pnl:+.2f}){worst_str}."
+            f"[DRAWDOWN AUDIT] Daily NAV delta {daily_pct:+.2f}% (USD {daily_pnl:+.2f}){worst_str}."
         )
     if buy_trades:
         audit_flags.append(
@@ -566,14 +566,14 @@ def run_daily_self_assessment():
     day_lbl = "vs Cash-Flow-Adjusted Prior Close" if abs(day_flows) >= 1.0 else "vs Previous Close"
     report = [
         f"**Session Type:** {session_hdr}",
-        f"**Portfolio Equity NAV:** CAD {equity:.2f}",
-        f"**Daily NAV Change:** CAD {daily_pnl:+.2f} ({daily_pct:+.2f}%) {day_lbl}",
+        f"**Portfolio Equity NAV:** USD {equity:.2f}",
+        f"**Daily NAV Change:** USD {daily_pnl:+.2f} ({daily_pct:+.2f}%) {day_lbl}",
     ]
     if weekly_summary:
         report.append(
-            f"**Weekly NAV Change (vs {weekly_summary['base_date']}):** CAD {weekly_summary['wow_pnl']:+.2f} "
+            f"**Weekly NAV Change (vs {weekly_summary['base_date']}):** USD {weekly_summary['wow_pnl']:+.2f} "
             f"({weekly_summary['wow_pct']:+.2f}%) | **Weekly Realized ({weekly_summary['closed_count']} exits: "
-            f"{weekly_summary['wins']}W/{weekly_summary['losses']}L):** CAD {weekly_summary['net_realized_pnl']:+.2f}"
+            f"{weekly_summary['wins']}W/{weekly_summary['losses']}L):** USD {weekly_summary['net_realized_pnl']:+.2f}"
         )
     if basket_pct is not None and prev_equity:
         report.append(
@@ -581,16 +581,16 @@ def run_daily_self_assessment():
         )
     has_contribs = abs(invested_capital - float(config.get("initial_cash", 1000.0))) >= 1.0
     cum_line = (
-        f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}% on CAD {invested_capital:,.2f} contributed | TWR: {twr_pct:+.2f}%)"
+        f"**Cumulative Return:** USD {cum_pnl:+.2f} ({cum_pct:+.2f}% on USD {invested_capital:,.2f} contributed | TWR: {twr_pct:+.2f}%)"
         if has_contribs
-        else f"**Cumulative Return:** CAD {cum_pnl:+.2f} ({cum_pct:+.2f}%) vs CAD {invested_capital:,.2f} seed"
+        else f"**Cumulative Return:** USD {cum_pnl:+.2f} ({cum_pct:+.2f}%) vs USD {invested_capital:,.2f} seed"
     )
     stock_mv = round(sum(float(pa.get("market_value", 0.0)) for pa in attribution), 2) if attribution else round(equity - cash, 2)
     accrued_div = round(equity - cash - stock_mv, 2)
     cap_line = (
-        f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {stock_mv:.2f} ({stock_mv/equity*100:.1f}%) | Accrued Div: CAD {accrued_div:.2f}"
+        f"**Capital Breakdown:** Cash: USD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: USD {stock_mv:.2f} ({stock_mv/equity*100:.1f}%) | Accrued Div: USD {accrued_div:.2f}"
         if accrued_div >= 0.50
-        else f"**Capital Breakdown:** Cash: CAD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: CAD {equity-cash:.2f} ({(equity-cash)/equity*100:.1f}%)"
+        else f"**Capital Breakdown:** Cash: USD {cash:.2f} ({cash/equity*100:.1f}%) | Equity: USD {equity-cash:.2f} ({(equity-cash)/equity*100:.1f}%)"
     )
     report.extend([
         cum_line,
@@ -602,36 +602,36 @@ def run_daily_self_assessment():
         for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
             sec_pct = (val / equity) * 100.0
             breach_tag = " ⚠️ [OVER 35% CAP]" if sec_pct > max_sector_pct else ""
-            report.append(f"- **{sec}**: CAD {val:.2f} (`{sec_pct:.1f}%` of NAV){breach_tag}")
+            report.append(f"- **{sec}**: USD {val:.2f} (`{sec_pct:.1f}%` of NAV){breach_tag}")
 
     if buy_trades:
         report.append("\n**Today's BUY Executions:**")
         for bt in buy_trades:
-            report.append(f"- {bt['ticker']} BUY {bt['quantity']:g} shs @ CAD {bt['price']:.2f} (`{bt['bucket']}`)")
+            report.append(f"- {bt['ticker']} BUY {bt['quantity']:g} shs @ USD {bt['price']:.2f} (`{bt['bucket']}`)")
 
     if realized_trades:
         report.append("\n**Realized Trades Today:**")
         for rt in realized_trades:
-            pnl_s = f" | P&L: CAD {rt['pnl']:+.2f} ({rt['pnl_pct']:+.1f}%)" if rt.get("pnl") is not None else ""
-            report.append(f"- {rt['ticker']} {rt['action']} {rt['quantity']:g} shs @ CAD {rt['price']:.2f}{pnl_s}")
+            pnl_s = f" | P&L: USD {rt['pnl']:+.2f} ({rt['pnl_pct']:+.1f}%)" if rt.get("pnl") is not None else ""
+            report.append(f"- {rt['ticker']} {rt['action']} {rt['quantity']:g} shs @ USD {rt['price']:.2f}{pnl_s}")
 
     if attribution:
         report.append("\n**Active Position Performance & Drawdown Attribution:**")
         for pa in attribution:
             fee_note = (
-                f" [Fill: CAD {pa['fill_price']:.2f}, Gross: CAD {pa['gross_pnl']:+.2f}, Entry Fee: CAD -{pa['entry_fee_cad']:.2f}]"
+                f" [Fill: USD {pa['fill_price']:.2f}, Gross: USD {pa['gross_pnl']:+.2f}, Entry Fee: USD -{pa['entry_fee_cad']:.2f}]"
                 if pa.get("entry_fee_cad", 0) > 0
                 else ""
             )
             report.append(
-                f"- **{pa['ticker']}** ({pa['sector']}, {pa['weight_pct']}% port, {pa['days_held']}d held): {pa['shares']:g} shs @ CAD {pa['current_price']:.2f} (ACB: CAD {pa['acb']:.2f}) "
-                f"| Unrealized: **CAD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)**{fee_note} | Buffer to Stop: CAD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
+                f"- **{pa['ticker']}** ({pa['sector']}, {pa['weight_pct']}% port, {pa['days_held']}d held): {pa['shares']:g} shs @ USD {pa['current_price']:.2f} (ACB: USD {pa['acb']:.2f}) "
+                f"| Unrealized: **USD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)**{fee_note} | Buffer to Stop: USD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
             )
 
     if risk_watchlist:
         report.append("\n**Risk Watchlist & Drawdown Drivers:**")
         for rw in risk_watchlist:
-            report.append(f"- ⚠️ **{rw['ticker']}**: {rw['note']} (Current: CAD {rw['current_price']:.2f}, Stop: CAD {rw['stop_price']:.2f}, Buffer: CAD {rw['distance_to_stop_cad']:.2f} / {rw['distance_to_stop_pct']:.1f}%)")
+            report.append(f"- ⚠️ **{rw['ticker']}**: {rw['note']} (Current: USD {rw['current_price']:.2f}, Stop: USD {rw['stop_price']:.2f}, Buffer: USD {rw['distance_to_stop_cad']:.2f} / {rw['distance_to_stop_pct']:.1f}%)")
 
     if actionable_missed:
         report.append(f"\n**Missed Actionable Setups ({len(actionable_missed)}):**")

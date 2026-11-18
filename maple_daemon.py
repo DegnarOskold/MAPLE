@@ -38,8 +38,8 @@ def start_daemon():
     state = get_ledger_state()
     print(f"Trading Mode:    {state.get('mode', 'LIVE')}")
     print(f"Broker Account:  #{state.get('account_id', 'N/A')}")
-    print(f"Cash Available:  ${state.get('cash', 0.0):.2f} CAD")
-    print(f"Total Equity:    ${state.get('total_equity', state.get('cash', 0.0)):.2f} CAD")
+    print(f"Cash Available:  ${state.get('cash', 0.0):.2f} USD")
+    print(f"Total Equity:    ${state.get('total_equity', state.get('cash', 0.0)):.2f} USD")
     print("Daemon active. Press Ctrl+C at any time to halt.")
     print("=" * 65 + "\n")
 

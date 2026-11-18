@@ -394,11 +394,11 @@ def run_chop_exit_guard() -> Dict[str, Any]:
         tgt = target_info.get("target_price", "N/A") if target_info else "N/A"
         stp = target_info.get("stop_loss_price", "N/A") if target_info else "N/A"
         stp_disp = (
-            f"CAD {stp} [Chop Floor: CAD {round(float(stp) * (1.0 - chop_buf_pct / 100.0), 2):.2f}]"
+            f"USD {stp} [Chop Floor: USD {round(float(stp) * (1.0 - chop_buf_pct / 100.0), 2):.2f}]"
             if isinstance(stp, (int, float))
             else str(stp)
         )
-        print(f"  * {t}: Current CAD {p:.2f} | Target: CAD {tgt} | Stop: {stp_disp}")
+        print(f"  * {t}: Current USD {p:.2f} | Target: USD {tgt} | Stop: {stp_disp}")
 
     # Evaluate target and opening-chop buffered stop triggers
     check_target_stops(price_map, market_data=chop_mkt, is_chop_window=True)
