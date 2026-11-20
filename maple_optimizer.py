@@ -172,36 +172,50 @@ def get_weekly_summary(
     }
 
 
+def _classify_buy_bucket(notes: str) -> str:
+    notes_up = (notes or "").upper()
+    if "CAPITULATION" in notes_up:
+        return "Capitulation Reversal"
+    if "LOW-VOLUME" in notes_up or "SCALED" in notes_up:
+        return "Low-Volume Scaled"
+    return "Regular Trend"
+
+
 def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
-    """Extracts realized SELL trades that occurred today from maple_trades.csv."""
+    """Extracts realized SELL trades that occurred today from maple_trades.csv, tagged with entry signal bucket."""
     realized = []
     if not os.path.exists(TRADES_FILE):
         return realized
 
     try:
+        import re
+        last_buy_bucket: Dict[str, str] = {}
         with open(TRADES_FILE, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 trade_date = row.get("Date", "")
                 action = row.get("Action", "").upper()
-                if trade_date.startswith(today_str) and action == "SELL":
-                    notes = row.get("Notes", "")
+                ticker = row.get("Ticker", "")
+                notes = row.get("Notes", "")
+                if action == "BUY" and ticker:
+                    last_buy_bucket[ticker] = _classify_buy_bucket(notes)
+                elif trade_date.startswith(today_str) and action == "SELL":
                     pnl_val = None
                     pnl_pct_val = None
                     # Parse P&L from notes if present: e.g. "P&L: $-19.42 (-11.23%)"
-                    import re
                     match = re.search(r"P&L:\s*\$?([-+]?[0-9]*\.?[0-9]+)\s*\(([-+]?[0-9]*\.?[0-9]+)%\)", notes)
                     if match:
                         pnl_val = float(match.group(1))
                         pnl_pct_val = float(match.group(2))
 
                     realized.append({
-                        "ticker": row.get("Ticker", ""),
+                        "ticker": ticker,
                         "action": action,
                         "quantity": float(row.get("Quantity", 0)),
                         "price": float(row.get("Price", 0)),
                         "pnl": pnl_val,
                         "pnl_pct": pnl_pct_val,
+                        "entry_bucket": last_buy_bucket.get(ticker, "Unknown"),
                         "notes": notes,
                     })
     except Exception as e:
@@ -219,18 +233,12 @@ def get_daily_buy_trades(today_str: str) -> List[Dict[str, Any]]:
         with open(TRADES_FILE, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 if row.get("Date", "").startswith(today_str) and row.get("Action", "").upper() == "BUY":
-                    notes_up = row.get("Notes", "").upper()
-                    bucket = (
-                        "Capitulation Reversal"
-                        if "CAPITULATION" in notes_up
-                        else ("Low-Volume Scaled" if ("LOW-VOLUME" in notes_up or "SCALED" in notes_up) else "Regular Trend")
-                    )
                     buys.append({
                         "ticker": row.get("Ticker", ""),
                         "action": "BUY",
                         "quantity": float(row.get("Quantity", 0)),
                         "price": float(row.get("Price", 0)),
-                        "bucket": bucket,
+                        "bucket": _classify_buy_bucket(row.get("Notes", "")),
                     })
     except Exception as e:
         print(f"[OPTIMIZER WARNING] Failed to read BUY trades: {e}")
@@ -542,6 +550,25 @@ def run_daily_self_assessment():
         audit_flags.append(
             f"[SIGNAL ATTRIBUTION] Today's BUY fills ({len(buy_trades)}): {reg_buys} Regular Trend, {scaled_buys} Low-Volume Scaled, {cap_buys} Capitulation Reversal."
         )
+    realized_with_pnl = [rt for rt in realized_trades if rt.get("pnl") is not None]
+    if realized_with_pnl:
+        by_bucket: Dict[str, Dict[str, Any]] = {}
+        for rt in realized_with_pnl:
+            b = rt.get("entry_bucket", "Unknown")
+            rec = by_bucket.setdefault(b, {"pnl": 0.0, "wins": 0, "losses": 0})
+            rec["pnl"] += float(rt["pnl"])
+            if float(rt["pnl"]) > 0:
+                rec["wins"] += 1
+            else:
+                rec["losses"] += 1
+        total_realized = sum(float(rt["pnl"]) for rt in realized_with_pnl)
+        parts = [
+            f"{b}: USD {v['pnl']:+.2f} ({v['wins']}W/{v['losses']}L)"
+            for b, v in sorted(by_bucket.items(), key=lambda x: x[1]["pnl"])
+        ]
+        audit_flags.append(
+            f"[REALIZED ATTRIBUTION] Closed P&L by entry signal (USD {total_realized:+.2f}): {'; '.join(parts)}."
+        )
 
     MapleStrategy._sync_from_config()
     actionable_missed = [m for m in missed if m.get("eligible")]
@@ -613,7 +640,8 @@ def run_daily_self_assessment():
         report.append("\n**Realized Trades Today:**")
         for rt in realized_trades:
             pnl_s = f" | P&L: USD {rt['pnl']:+.2f} ({rt['pnl_pct']:+.1f}%)" if rt.get("pnl") is not None else ""
-            report.append(f"- {rt['ticker']} {rt['action']} {rt['quantity']:g} shs @ USD {rt['price']:.2f}{pnl_s}")
+            bkt_s = f" (`{rt['entry_bucket']}`)" if rt.get("entry_bucket") and rt.get("entry_bucket") != "Unknown" else ""
+            report.append(f"- {rt['ticker']} {rt['action']} {rt['quantity']:g} shs @ USD {rt['price']:.2f}{bkt_s}{pnl_s}")
 
     if attribution:
         report.append("\n**Active Position Performance & Drawdown Attribution:**")

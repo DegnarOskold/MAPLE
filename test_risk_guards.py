@@ -536,7 +536,7 @@ def run_checks():
     ew_pct, _ = MapleStrategy.calculate_tranche_size(
         {"Price": 78.50, "Open": 77.50, "EMA_5": 77.80, "EMA_9": 77.10, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 2.0, "Vol_SMA_10": 500000.0, "Intraday_Dollar_Vol": 5000000.0, "ADX_14": 32.0, "RSI_7": 55.0}
     )
-    assert ew_pct == 0.20, f"Event-week max tranche cap should be 0.20, got {ew_pct}"
+    assert ew_pct == MapleStrategy.MAX_TRANCHE_PCT, f"Max tranche cap should match config ({MapleStrategy.MAX_TRANCHE_PCT}), got {ew_pct}"
 
     ratch_cfg = {
         "trading_mode": "LIVE",
@@ -735,7 +735,8 @@ def run_checks():
         {"Price": 116.50, "Open": 115.80, "EMA_5": 116.00, "EMA_9": 115.20, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.05, "ADX_14": 40.0, "RSI_7": 58.0},
         signal_type="LOW-VOLUME SCALED ENTRY",
     )
-    assert lv_cap == MapleStrategy.MIN_TRANCHE_PCT and "Capped at 15%" in lv_cap_r, f"Scaled entry exceeded 15% floor: {lv_cap}, {lv_cap_r}"
+    min_pct_int = int(round(MapleStrategy.MIN_TRANCHE_PCT * 100))
+    assert lv_cap == MapleStrategy.MIN_TRANCHE_PCT and f"Capped at {min_pct_int}%" in lv_cap_r, f"Scaled entry exceeded {min_pct_int}% floor: {lv_cap}, {lv_cap_r}"
 
     with patch.object(maple_optimizer, "get_position_holding_days", return_value={"ENGH.TO": 3}), \
          patch.object(maple_optimizer, "get_position_last_buy_info", return_value={"ENGH.TO": {"fill_acb": 18.60, "shares": 41.0}}):
@@ -860,11 +861,16 @@ def run_checks():
         "AAPL": {"Price": 350.0, "Open": 345.0, "EMA_5": 348.0, "EMA_9": 344.0, "SMA_50": 330.0, "Ret_20d": 2.5, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.50, "ADX_14": 30.0, "RSI_7": 55.0},
         "NVDA": {"Price": 155.0, "Open": 152.0, "EMA_5": 154.0, "EMA_9": 151.0, "SMA_50": 140.0, "Ret_20d": 11.2, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.50, "ADX_14": 29.0, "RSI_7": 55.0},
         "TXN": {"Price": 295.0, "Open": 292.0, "EMA_5": 294.0, "EMA_9": 291.0, "SMA_50": 285.0, "Ret_20d": 4.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.60, "ADX_14": 17.5, "RSI_7": 55.0},
+        "NKE": {"Price": 36.20, "Open": 35.50, "Pct_From_Low": 2.50, "EMA_5": 37.0, "EMA_9": 38.0, "SMA_50": 42.0, "Ret_20d": -10.0, "EMA_Crossover": "BEARISH (EMA5 < EMA9)", "Vol_Ratio": 1.60, "ADX_14": 28.0, "RSI_7": 26.0},
     }
     ranked_sigs = maple_brain.evaluate_autonomous_signals(
-        rank_mkt, {"AAPL", "NVDA", "TXN"}, macro_state={"GC=F": True, "CL=F": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": True}
+        rank_mkt, {"AAPL", "NVDA", "TXN", "NKE"}, macro_state={"GC=F": True, "CL=F": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": True}
     )
-    assert [s["ticker"] for s in ranked_sigs] == ["NVDA", "AAPL"], f"Ret_20d tie-breaker or SPY_BELOW_SMA50 single-bypass filter failed: {ranked_sigs}"
+    assert [s["ticker"] for s in ranked_sigs] == ["NVDA", "AAPL"], f"Ret_20d tie-breaker or SPY_BELOW_SMA50 gate (Single-Bypass/Capitulation) failed: {ranked_sigs}"
+    cap_above_spy = maple_brain.evaluate_autonomous_signals(
+        rank_mkt, {"NKE"}, macro_state={"GC=F": True, "CL=F": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
+    )
+    assert [s["ticker"] for s in cap_above_spy] == ["NKE"], f"Capitulation Reversal should pass when SPY >= 50-SMA: {cap_above_spy}"
 
     import maple_backtest
     assert callable(maple_backtest.run_backtest) and maple_backtest.run_backtest({})["trades"] == 0

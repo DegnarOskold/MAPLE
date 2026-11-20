@@ -280,16 +280,17 @@ def evaluate_autonomous_signals(
             print(f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - {macro_reason}")
             continue
 
-        if (
-            macro_state
-            and macro_state.get("SPY_BELOW_SMA50", False)
-            and cand_type != "CAPITULATION REVERSAL"
-            and "Single-Bypass Rule" in rationale
-        ):
-            print(
-                f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - S&P 500 (SPY) below 50-SMA (Single-Bypass gated)"
-            )
-            continue
+        if macro_state and macro_state.get("SPY_BELOW_SMA50", False):
+            if cand_type == "CAPITULATION REVERSAL":
+                print(
+                    f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - S&P 500 (SPY) below 50-SMA (Capitulation Reversal gated)"
+                )
+                continue
+            if "Single-Bypass Rule" in rationale:
+                print(
+                    f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - S&P 500 (SPY) below 50-SMA (Single-Bypass gated)"
+                )
+                continue
 
         vr_val = float(vol_ratio) if isinstance(vol_ratio, (int, float)) else 0.0
         adx_val = float(sd.get("ADX_14")) if isinstance(sd.get("ADX_14"), (int, float)) else 0.0
