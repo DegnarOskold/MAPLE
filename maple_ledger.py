@@ -559,20 +559,15 @@ def _size_whole_shares(
     return shares
 
 
-def execute_buy(
+def _preflight_buy(
     ticker: str,
     allocated_cash: float,
     current_price: float,
-    target_price: Optional[float] = None,
-    stop_loss_price: Optional[float] = None,
     notes: str = "",
     open_price: Optional[float] = None,
+    check_cash: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Executes a BUY order.
-    In LIVE mode: validates Shariah whitelist, daily drawdown vs previous close, concentration & sector caps,
-    scale-in cooldown/green-candle guard, submits a Limit Day Order, and polls for fill confirmation.
-    In SIMULATED mode: updates local ledger.
-    """
+    """Validates all pre-trade BUY guards and returns sizing/broker context, or None if blocked."""
     ticker = normalize_ticker(ticker)
     is_sweep = ticker == SWEEP_ETF
     config = load_config()
@@ -650,95 +645,250 @@ def execute_buy(
     )
 
     if is_live:
-        try:
-            client = get_broker_client()
-            if not client.is_authenticated():
-                print("[MAPLE LIVE BLOCKED] Broker gateway not authenticated. Please log in at https://localhost:5000")
-                return None
-            account_id = config.get("account_id") or client.get_primary_account_id()
+        client = get_broker_client()
+        if not client.is_authenticated():
+            print("[MAPLE LIVE BLOCKED] Broker gateway not authenticated. Please log in at https://localhost:5000")
+            return None
+        account_id = config.get("account_id") or client.get_primary_account_id()
 
-            # Circuit Breaker 2 & 3: Dynamic Order Cap + Cash-Flow-Adjusted Daily Drawdown Limit (4% of ref NAV)
-            balances = client.get_balances(account_id)
-            total_equity = float(balances.get("total_equity", 1000.0))
-            cash_available = float(balances.get("cash", 0.0))
+        balances = client.get_balances(account_id)
+        total_equity = float(balances.get("total_equity", 1000.0))
+        cash_available = float(balances.get("cash", 0.0))
+        if check_cash:
             try:
                 reconcile_capital_flows(cash_available, live_equity=total_equity, config=config)
             except Exception:
                 pass
-            min_trade_thresh = get_effective_min_trade(config, total_equity)
-            max_single_cap = get_effective_order_cap(config, total_equity)
-            if not is_sweep and allocated_cash > max_single_cap:
-                allocated_cash = max_single_cap
+        min_trade_thresh = get_effective_min_trade(config, total_equity)
+        max_single_cap = get_effective_order_cap(config, total_equity)
+        if not is_sweep and allocated_cash > max_single_cap:
+            allocated_cash = max_single_cap
 
-            ref_nav = _get_reference_nav(config)
-            daily_loss_limit = get_effective_daily_loss_limit(config, ref_nav)
-            drawdown = ref_nav - total_equity
-            if drawdown >= daily_loss_limit:
-                print(f"[MAPLE CIRCUIT BREAKER] Daily loss limit exceeded vs prev close (${ref_nav:.2f}): -${drawdown:.2f} >= ${daily_loss_limit:.2f}. All buying halted.")
+        ref_nav = _get_reference_nav(config)
+        daily_loss_limit = get_effective_daily_loss_limit(config, ref_nav)
+        drawdown = ref_nav - total_equity
+        if drawdown >= daily_loss_limit:
+            print(f"[MAPLE CIRCUIT BREAKER] Daily loss limit exceeded vs prev close (${ref_nav:.2f}): -${drawdown:.2f} >= ${daily_loss_limit:.2f}. All buying halted.")
+            return None
+
+        positions_raw = client.get_positions(account_id)
+        live_held = {
+            normalize_ticker(p.get("symbol", ""))
+            for p in positions_raw
+            if float(p.get("openQuantity", 0.0)) > 0
+        }
+        aliases = set(ticker_aliases(ticker))
+        existing_pos = next((p for p in positions_raw if normalize_ticker(p.get("symbol", "")) in aliases or p.get("symbol", "").upper() in aliases), None)
+        existing_shares = float(existing_pos.get("openQuantity", 0.0)) if existing_pos else 0.0
+        existing_acb = float(existing_pos.get("averageEntryPrice", current_price)) if existing_pos else 0.0
+        if not is_sweep and not _passes_scale_in_guards(active_tickers=live_held, fallback_px=existing_acb):
+            return None
+        existing_val = existing_shares * current_price
+        max_pos_cad = total_equity * max_pos_pct
+        if not is_sweep and existing_val + allocated_cash > max_pos_cad:
+            allocated_cash = max(0.0, max_pos_cad - existing_val)
+            if allocated_cash < min_trade_thresh:
+                print(f"[MAPLE CONCENTRATION GUARD] {ticker} already at ${existing_val:.2f} ({existing_val/total_equity*100:.1f}% of NAV, cap {max_pos_pct*100:.0f}%). Order blocked.")
                 return None
 
-            # Circuit Breaker 4: Position Concentration Cap (default 25% of portfolio NAV) + Live Scale-In Reconciliation
-            positions_raw = client.get_positions(account_id)
-            live_held = {
-                normalize_ticker(p.get("symbol", ""))
-                for p in positions_raw
-                if float(p.get("openQuantity", 0.0)) > 0
-            }
-            aliases = set(ticker_aliases(ticker))
-            existing_pos = next((p for p in positions_raw if normalize_ticker(p.get("symbol", "")) in aliases or p.get("symbol", "").upper() in aliases), None)
-            existing_shares = float(existing_pos.get("openQuantity", 0.0)) if existing_pos else 0.0
-            existing_acb = float(existing_pos.get("averageEntryPrice", current_price)) if existing_pos else 0.0
-            if not is_sweep and not _passes_scale_in_guards(active_tickers=live_held, fallback_px=existing_acb):
+        held_sector_tickers = set()
+        held_sector_cad = 0.0
+        for p in positions_raw:
+            p_sym = normalize_ticker(p.get("symbol", ""))
+            p_qty = float(p.get("openQuantity", 0.0))
+            if p_qty > 0 and get_ticker_sector(p_sym) == target_sector:
+                held_sector_tickers.add(p_sym)
+                p_px = current_price if p_sym == ticker else float(p.get("currentPrice") or p.get("averageEntryPrice") or 0.0)
+                held_sector_cad += p_qty * p_px
+        pending_norm = {normalize_ticker(k) for k in pending_orders.keys()}
+        for t_sym, t_info in get_position_last_buy_info().items():
+            if (
+                get_ticker_sector(t_sym) == target_sector
+                and t_sym not in held_sector_tickers
+                and t_sym not in pending_norm
+                and t_info.get("last_buy_dt")
+                and (datetime.datetime.now() - t_info["last_buy_dt"]).total_seconds() < 600
+            ):
+                held_sector_cad += float(t_info.get("shares", 0.0)) * float(t_info.get("last_buy_price", 0.0))
+
+        sector_exposure = held_sector_cad + pending_sector_cad
+        max_sector_cad = total_equity * max_sector_pct
+        if not is_sweep and sector_exposure + allocated_cash > max_sector_cad:
+            allocated_cash = max(0.0, max_sector_cad - sector_exposure)
+            if allocated_cash < min_trade_thresh:
+                print(
+                    f"[MAPLE SECTOR CAP] {target_sector} exposure at ${sector_exposure:.2f} ({sector_exposure/total_equity*100:.1f}% of NAV, cap {max_sector_pct*100:.0f}%). Blocking {ticker}."
+                )
                 return None
-            existing_val = existing_shares * current_price
-            max_pos_cad = total_equity * max_pos_pct
-            if not is_sweep and existing_val + allocated_cash > max_pos_cad:
-                allocated_cash = max(0.0, max_pos_cad - existing_val)
-                if allocated_cash < min_trade_thresh:
-                    print(f"[MAPLE CONCENTRATION GUARD] {ticker} already at ${existing_val:.2f} ({existing_val/total_equity*100:.1f}% of NAV, cap {max_pos_pct*100:.0f}%). Order blocked.")
-                    return None
 
-            # Circuit Breaker 5: Sector Exposure Cap (default 35% of portfolio NAV across held + resting BUY orders)
-            held_sector_tickers = set()
-            held_sector_cad = 0.0
-            for p in positions_raw:
-                p_sym = normalize_ticker(p.get("symbol", ""))
-                p_qty = float(p.get("openQuantity", 0.0))
-                if p_qty > 0 and get_ticker_sector(p_sym) == target_sector:
-                    held_sector_tickers.add(p_sym)
-                    p_px = current_price if p_sym == ticker else float(p.get("currentPrice") or p.get("averageEntryPrice") or 0.0)
-                    held_sector_cad += p_qty * p_px
-            # Include any same-scan fill not yet reflected in broker positions_raw or pending_orders
-            pending_norm = {normalize_ticker(k) for k in pending_orders.keys()}
-            for t_sym, t_info in get_position_last_buy_info().items():
-                if (
-                    get_ticker_sector(t_sym) == target_sector
-                    and t_sym not in held_sector_tickers
-                    and t_sym not in pending_norm
-                    and t_info.get("last_buy_dt")
-                    and (datetime.datetime.now() - t_info["last_buy_dt"]).total_seconds() < 600
-                ):
-                    held_sector_cad += float(t_info.get("shares", 0.0)) * float(t_info.get("last_buy_price", 0.0))
-
-            sector_exposure = held_sector_cad + pending_sector_cad
-            max_sector_cad = total_equity * max_sector_pct
-            if not is_sweep and sector_exposure + allocated_cash > max_sector_cad:
-                allocated_cash = max(0.0, max_sector_cad - sector_exposure)
-                if allocated_cash < min_trade_thresh:
-                    print(
-                        f"[MAPLE SECTOR CAP] {target_sector} exposure at ${sector_exposure:.2f} ({sector_exposure/total_equity*100:.1f}% of NAV, cap {max_sector_pct*100:.0f}%). Blocking {ticker}."
-                    )
-                    return None
-
-            cash_available = balances.get("cash", 0.0)
-            # Cash Reserve Buffer ($20 CAD minimum left for liquidity/ECN)
-            safe_cash = max(0.0, cash_available - 20.0)
+        safe_cash = max(0.0, cash_available - 20.0)
+        if check_cash:
             if allocated_cash > safe_cash:
                 allocated_cash = safe_cash
-
             if allocated_cash < min_trade_thresh:
                 print(f"[MAPLE] Insufficient free cash for {ticker}: ${allocated_cash:.2f} (Available: ${cash_available:.2f})")
                 return None
+        else:
+            if allocated_cash < min_trade_thresh:
+                print(f"[MAPLE] Insufficient or capped cash for {ticker}: ${allocated_cash:.2f}")
+                return None
+            max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
+            est_shs = (
+                int(allocated_cash // current_price)
+                if is_sweep and current_price > 0
+                else _size_whole_shares(
+                    ticker, allocated_cash, current_price, existing_shares, existing_val,
+                    total_equity, max_pos_pct, max_single_cap, sector_exposure, max_sector_pct,
+                    allocated_cash, max_single_share_pct,
+                )
+            )
+            if est_shs <= 0 or (existing_shares > 0 and est_shs * current_price < min_trade_thresh):
+                return None
+
+        return {
+            "is_live": True,
+            "is_sweep": is_sweep,
+            "config": config,
+            "client": client,
+            "account_id": account_id,
+            "total_equity": total_equity,
+            "cash_available": cash_available,
+            "safe_cash": safe_cash,
+            "allocated_cash": allocated_cash,
+            "min_trade_thresh": min_trade_thresh,
+            "max_single_cap": max_single_cap,
+            "max_pos_pct": max_pos_pct,
+            "max_sector_pct": max_sector_pct,
+            "existing_shares": existing_shares,
+            "existing_acb": existing_acb,
+            "existing_val": existing_val,
+            "sector_exposure": sector_exposure,
+        }
+
+    state = get_ledger_state()
+    cash = state["cash"]
+    total_equity = state.get("total_equity", cash)
+    min_trade_thresh = get_effective_min_trade(config, total_equity)
+    max_single_cap = get_effective_order_cap(config, total_equity)
+    if not is_sweep and allocated_cash > max_single_cap:
+        allocated_cash = max_single_cap
+    existing_pos = state["positions"].get(ticker, {})
+    current_shares = existing_pos.get("shares", 0.0)
+    existing_acb = existing_pos.get("acb", current_price)
+    existing_val = current_shares * current_price
+    if not is_sweep and existing_val + allocated_cash > total_equity * max_pos_pct:
+        allocated_cash = max(0.0, total_equity * max_pos_pct - existing_val)
+
+    sim_sector_cad = pending_sector_cad + sum(
+        p["shares"] * (current_price if normalize_ticker(t) == ticker else float(p.get("current_price") or p.get("acb") or 0.0))
+        for t, p in state["positions"].items()
+        if p.get("shares", 0.0) > 0 and get_ticker_sector(t) == target_sector
+    )
+    if not is_sweep and sim_sector_cad + allocated_cash > total_equity * max_sector_pct:
+        allocated_cash = max(0.0, total_equity * max_sector_pct - sim_sector_cad)
+        if allocated_cash < min_trade_thresh:
+            print(
+                f"[MAPLE SECTOR CAP] {target_sector} exposure at ${sim_sector_cad:.2f} ({sim_sector_cad/total_equity*100:.1f}% of NAV, cap {max_sector_pct*100:.0f}%). Blocking {ticker}."
+            )
+            return None
+
+    if check_cash and allocated_cash > cash:
+        allocated_cash = cash
+    if allocated_cash < min_trade_thresh:
+        print(f"[MAPLE] Insufficient or capped cash for {ticker}: ${allocated_cash:.2f}")
+        return None
+    if not check_cash:
+        max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
+        est_shs = (
+            int(allocated_cash // current_price)
+            if is_sweep and current_price > 0
+            else _size_whole_shares(
+                ticker, allocated_cash, current_price, current_shares, existing_val,
+                total_equity, max_pos_pct, max_single_cap, sim_sector_cad, max_sector_pct,
+                allocated_cash, max_single_share_pct,
+            )
+        )
+        if est_shs <= 0 or (current_shares > 0 and est_shs * current_price < min_trade_thresh):
+            return None
+
+    return {
+        "is_live": False,
+        "is_sweep": is_sweep,
+        "config": config,
+        "state": state,
+        "cash": cash,
+        "total_equity": total_equity,
+        "allocated_cash": allocated_cash,
+        "min_trade_thresh": min_trade_thresh,
+        "max_single_cap": max_single_cap,
+        "max_pos_pct": max_pos_pct,
+        "max_sector_pct": max_sector_pct,
+        "current_shares": current_shares,
+        "existing_acb": existing_acb,
+        "existing_val": existing_val,
+        "sim_sector_cad": sim_sector_cad,
+    }
+
+
+def preflight_buy(
+    ticker: str,
+    allocated_cash: float,
+    current_price: float,
+    notes: str = "",
+    open_price: Optional[float] = None,
+) -> float:
+    """Returns approved allocation if all non-cash BUY guards pass (before sweep unwind), else 0.0."""
+    try:
+        ctx = _preflight_buy(ticker, allocated_cash, current_price, notes=notes, open_price=open_price, check_cash=False)
+        return float(ctx["allocated_cash"]) if ctx else 0.0
+    except Exception:
+        return 0.0
+
+
+def execute_buy(
+    ticker: str,
+    allocated_cash: float,
+    current_price: float,
+    target_price: Optional[float] = None,
+    stop_loss_price: Optional[float] = None,
+    notes: str = "",
+    open_price: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Executes a BUY order.
+    In LIVE mode: validates Shariah whitelist, daily drawdown vs previous close, concentration & sector caps,
+    scale-in cooldown/green-candle guard, submits a Limit Day Order, and polls for fill confirmation.
+    In SIMULATED mode: updates local ledger.
+    """
+    ticker = normalize_ticker(ticker)
+    is_sweep = ticker == SWEEP_ETF
+    config = load_config()
+    is_live = config.get("trading_mode", "").upper() == "LIVE"
+
+    try:
+        ctx = _preflight_buy(ticker, allocated_cash, current_price, notes=notes, open_price=open_price, check_cash=True)
+    except Exception as e:
+        print(f"[MAPLE LIVE ORDER FAILED] Error executing buy for {ticker}: {e}")
+        return None
+    if not ctx:
+        return None
+
+    allocated_cash = ctx["allocated_cash"]
+    min_trade_thresh = ctx["min_trade_thresh"]
+    max_single_cap = ctx["max_single_cap"]
+    max_pos_pct = ctx["max_pos_pct"]
+    max_sector_pct = ctx["max_sector_pct"]
+
+    if is_live:
+        try:
+            client = ctx["client"]
+            account_id = ctx["account_id"]
+            total_equity = ctx["total_equity"]
+            cash_available = ctx["cash_available"]
+            safe_cash = ctx["safe_cash"]
+            existing_shares = ctx["existing_shares"]
+            existing_acb = ctx["existing_acb"]
+            existing_val = ctx["existing_val"]
+            sector_exposure = ctx["sector_exposure"]
 
             # Resolve Symbol and Quote
             sym_obj = client.search_symbol(ticker)
@@ -914,38 +1064,13 @@ def execute_buy(
             return None
 
     # SIMULATED MODE
-    state = get_ledger_state()
-    cash = state["cash"]
-    total_equity = state.get("total_equity", cash)
-    min_trade_thresh = get_effective_min_trade(config, total_equity)
-    max_single_cap = get_effective_order_cap(config, total_equity)
-    if not is_sweep and allocated_cash > max_single_cap:
-        allocated_cash = max_single_cap
-    existing_pos = state["positions"].get(ticker, {})
-    current_shares = existing_pos.get("shares", 0.0)
-    existing_acb = existing_pos.get("acb", current_price)
-    existing_val = current_shares * current_price
-    if not is_sweep and existing_val + allocated_cash > total_equity * max_pos_pct:
-        allocated_cash = max(0.0, total_equity * max_pos_pct - existing_val)
-
-    sim_sector_cad = pending_sector_cad + sum(
-        p["shares"] * (current_price if normalize_ticker(t) == ticker else float(p.get("current_price") or p.get("acb") or 0.0))
-        for t, p in state["positions"].items()
-        if p.get("shares", 0.0) > 0 and get_ticker_sector(t) == target_sector
-    )
-    if not is_sweep and sim_sector_cad + allocated_cash > total_equity * max_sector_pct:
-        allocated_cash = max(0.0, total_equity * max_sector_pct - sim_sector_cad)
-        if allocated_cash < min_trade_thresh:
-            print(
-                f"[MAPLE SECTOR CAP] {target_sector} exposure at ${sim_sector_cad:.2f} ({sim_sector_cad/total_equity*100:.1f}% of NAV, cap {max_sector_pct*100:.0f}%). Blocking {ticker}."
-            )
-            return None
-
-    if allocated_cash > cash:
-        allocated_cash = cash
-    if allocated_cash < min_trade_thresh:
-        print(f"[MAPLE] Insufficient or capped cash for {ticker}: ${allocated_cash:.2f}")
-        return None
+    state = ctx["state"]
+    cash = ctx["cash"]
+    total_equity = ctx["total_equity"]
+    current_shares = ctx["current_shares"]
+    existing_acb = ctx["existing_acb"]
+    existing_val = ctx["existing_val"]
+    sim_sector_cad = ctx["sim_sector_cad"]
 
     max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
     if is_sweep:

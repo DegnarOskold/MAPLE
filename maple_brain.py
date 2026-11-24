@@ -31,6 +31,7 @@ from maple_market import (
 from maple_ledger import (
     get_ledger_state,
     get_effective_order_cap,
+    preflight_buy,
     execute_buy,
     execute_sell,
     check_target_stops,
@@ -545,6 +546,17 @@ def run_intraday_scan(bot_advice: str = ""):
                         price_map[SWEEP_ETF] = sweep_px
                 avail_funds = curr_cash + (sweep_shs * sweep_px if (sweep_shs > 0 and sweep_px > 0) else 0.0)
                 allocated = round(min(avail_funds, curr_nav * tranche_pct), 2)
+                buy_notes = f"[{sig_type}] Dynamic Tranche {tranche_pct*100:.1f}% ({rationale})"
+                approved_alloc = preflight_buy(
+                    ticker,
+                    allocated,
+                    current_price,
+                    notes=buy_notes,
+                    open_price=stock_info.get("Open"),
+                )
+                if approved_alloc <= 0.0:
+                    continue
+                allocated = round(approved_alloc, 2)
                 free_cash = max(0.0, curr_cash - (20.0 if is_live else 0.0))
                 if allocated > free_cash and sweep_shs > 0 and sweep_px > 0:
                     need_shs = min(sweep_shs, math.ceil((allocated - free_cash + 2.0) / sweep_px))
