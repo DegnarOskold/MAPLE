@@ -384,8 +384,8 @@ def get_stock_data(
 
 
 def get_macro_alignment() -> Dict[str, Any]:
-    """Checks intraday/daily directional alignment for Gold (GC=F), Crude Oil (CL=F), VIX panic (^VIX), and S&P 500 trend (SPY)."""
-    state: Dict[str, Any] = {"GC=F": True, "CL=F": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
+    """Checks intraday/daily directional alignment for Gold (GC=F), Crude Oil (CL=F), VIX regime (^VIX), and S&P 500 trend (SPY)."""
+    state: Dict[str, Any] = {"GC=F": True, "CL=F": True, "VIX_ELEVATED": False, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
     for sym in ("GC=F", "CL=F"):
         try:
             hist = yf.Ticker(sym).history(period="5d", timeout=8)
@@ -394,11 +394,12 @@ def get_macro_alignment() -> Dict[str, Any]:
         except Exception:
             pass
     try:
-        # ponytail: VIX >= 25 or +10% day spike proxy for broad-market panic
+        # ponytail: VIX >= 25 or +10% spike -> 0.5x tranche (VIX_ELEVATED); VIX >= 35 -> full freeze (VIX_PANIC)
         vh = yf.Ticker("^VIX").history(period="5d", timeout=8)
         if vh is not None and len(vh) >= 2:
             v_cur, v_prev = float(vh["Close"].iloc[-1]), float(vh["Close"].iloc[-2])
-            state["VIX_PANIC"] = v_cur >= 25.0 or (v_prev > 0 and ((v_cur - v_prev) / v_prev) >= 0.10)
+            state["VIX_ELEVATED"] = v_cur >= 25.0 or (v_prev > 0 and ((v_cur - v_prev) / v_prev) >= 0.10)
+            state["VIX_PANIC"] = v_cur >= 35.0
     except Exception:
         pass
     try:
@@ -422,5 +423,5 @@ def is_macro_aligned(ticker: str, macro_state: Optional[Dict[str, Any]] = None) 
     if t in OIL_LINKED_TICKERS:
         return (True, "Aligned") if macro_state.get("CL=F", True) else (False, "Crude Oil futures (CL=F) negative vs prior close")
     if macro_state.get("VIX_PANIC", False):
-        return False, "Broad-market VIX panic regime (^VIX >= 25 or >= +10% spike) - non-commodity entries gated"
+        return False, "Broad-market VIX panic regime (^VIX >= 35) - non-commodity entries gated"
     return True, "Aligned"

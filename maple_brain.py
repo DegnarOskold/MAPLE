@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import re
+import math
 import datetime
 from typing import Dict, Any, List, Optional
 
@@ -24,6 +25,8 @@ from maple_market import (
     prefetch_histories,
     get_macro_alignment,
     is_macro_aligned,
+    GOLD_LINKED_TICKERS,
+    OIL_LINKED_TICKERS,
 )
 from maple_ledger import (
     get_ledger_state,
@@ -36,6 +39,7 @@ from maple_ledger import (
     normalize_ticker,
     ticker_aliases,
     SHARIAH_COMPLIANT_BASKET,
+    SWEEP_ETF,
 )
 from maple_strategy import MapleStrategy
 
@@ -280,6 +284,15 @@ def evaluate_autonomous_signals(
             print(f"[MAPLE MACRO FILTER] {ticker} ({cand_type}): Suppressed - {macro_reason}")
             continue
 
+        if (
+            macro_state
+            and macro_state.get("VIX_ELEVATED", False)
+            and ticker not in GOLD_LINKED_TICKERS
+            and ticker not in OIL_LINKED_TICKERS
+        ):
+            tranche_pct = round(tranche_pct * 0.5, 4)
+            rationale = f"{rationale}, 0.5x VIX Elevated"
+
         if macro_state and macro_state.get("SPY_BELOW_SMA50", False):
             if cand_type == "CAPITULATION REVERSAL":
                 print(
@@ -327,7 +340,9 @@ def run_chop_exit_guard() -> Dict[str, Any]:
 
     state = get_ledger_state()
     held_positions = {
-        normalize_ticker(t): p for t, p in state.get("positions", {}).items() if p.get("shares", 0) > 0
+        normalize_ticker(t): p
+        for t, p in state.get("positions", {}).items()
+        if p.get("shares", 0) > 0 and normalize_ticker(t) != SWEEP_ETF
     }
 
     if not held_positions:
@@ -466,7 +481,7 @@ def run_intraday_scan(bot_advice: str = ""):
             f"Evaluated {len(market_data)}/{len(allowed_tickers)} Shariah-compliant US tickers -> "
             f"{len(signals)} actionable signal(s) (Macro: GC=F={'UP' if macro_state.get('GC=F', True) else 'DOWN'}, "
             f"CL=F={'UP' if macro_state.get('CL=F', True) else 'DOWN'}, "
-            f"VIX={'PANIC' if macro_state.get('VIX_PANIC', False) else 'CALM'})."
+            f"VIX={'PANIC' if macro_state.get('VIX_PANIC', False) else ('ELEVATED(0.5x)' if macro_state.get('VIX_ELEVATED', False) else 'CALM')})."
         )
 
     if signals:
@@ -520,7 +535,30 @@ def run_intraday_scan(bot_advice: str = ""):
                 existing_pos = curr_state.get("positions", {}).get(ticker, {})
                 existing_shs = float(existing_pos.get("shares", 0.0))
                 existing_acb = float(existing_pos.get("acb", current_price))
-                allocated = round(min(curr_cash, curr_nav * tranche_pct), 2)
+                sweep_pos = curr_state.get("positions", {}).get(SWEEP_ETF, {})
+                sweep_shs = int(sweep_pos.get("shares", 0))
+                sweep_px = float(price_map.get(SWEEP_ETF) or sweep_pos.get("current_price") or sweep_pos.get("acb") or 0.0)
+                if sweep_shs > 0 and sweep_px <= 0:
+                    sp_sd = get_stock_data(SWEEP_ETF, mode="SHORT")
+                    sweep_px = float(sp_sd["Price"]) if sp_sd and isinstance(sp_sd.get("Price"), (int, float)) else 0.0
+                    if sweep_px > 0:
+                        price_map[SWEEP_ETF] = sweep_px
+                avail_funds = curr_cash + (sweep_shs * sweep_px if (sweep_shs > 0 and sweep_px > 0) else 0.0)
+                allocated = round(min(avail_funds, curr_nav * tranche_pct), 2)
+                free_cash = max(0.0, curr_cash - (20.0 if is_live else 0.0))
+                if allocated > free_cash and sweep_shs > 0 and sweep_px > 0:
+                    need_shs = min(sweep_shs, math.ceil((allocated - free_cash + 2.0) / sweep_px))
+                    if need_shs > 0:
+                        print(f"[MAPLE SWEEP UNWIND] Selling {need_shs} {SWEEP_ETF} @ ~${sweep_px:.2f} to fund {ticker} BUY...")
+                        unwind_res = execute_sell(SWEEP_ETF, sweep_px, reason=f"Sweep Unwind for {ticker} BUY", shares_to_sell=need_shs)
+                        if unwind_res and unwind_res.get("action") == "SELL":
+                            curr_state = get_ledger_state()
+                            curr_cash = curr_state["cash"]
+                            allocated = round(min(curr_cash, allocated), 2)
+                        else:
+                            allocated = round(min(curr_cash, allocated), 2)
+                else:
+                    allocated = round(min(curr_cash, allocated), 2)
                 raw_shs = allocated / current_price
                 estimated_shares = int(raw_shs) + (1 if int(raw_shs) >= 1 and (raw_shs - int(raw_shs)) >= 0.5 and (int(raw_shs) + 1) * current_price <= allocated * 1.15 else 0)
                 estimated_shares = max(1, estimated_shares)
@@ -552,6 +590,28 @@ def run_intraday_scan(bot_advice: str = ""):
 
     # Output current portfolio equity using real-time price_map marks when available
     updated_state = get_ledger_state()
+
+    # Idle-Cash Sweep: park excess cash (> 10% NAV buffer) into SPUS during regular post-chop trading hours
+    if (
+        config.get("idle_cash_sweep", False)
+        and (market_active or not is_live)
+        and not (is_opening_chop() and is_live)
+        and (not is_live or ledger_state.get("live_verified", False))
+    ):
+        sw_cash = float(updated_state.get("cash", 0.0))
+        sw_nav = float(updated_state.get("total_equity") or sw_cash)
+        excess_cash = round(sw_cash - (sw_nav * 0.10) - (20.0 if is_live else 0.0), 2)
+        if excess_cash >= max(250.0, sw_nav * 0.05):
+            sp_px = price_map.get(SWEEP_ETF)
+            if not sp_px:
+                sp_sd = get_stock_data(SWEEP_ETF, mode="SHORT")
+                if sp_sd and isinstance(sp_sd.get("Price"), (int, float)) and sp_sd["Price"] > 0:
+                    sp_px = float(sp_sd["Price"])
+                    price_map[SWEEP_ETF] = sp_px
+            if sp_px and excess_cash >= sp_px:
+                print(f"[MAPLE IDLE-CASH SWEEP] Deploying ${excess_cash:.2f} excess cash (>10% NAV buffer) into {SWEEP_ETF} @ ~${sp_px:.2f}...")
+                if execute_buy(SWEEP_ETF, excess_cash, sp_px, notes="[IDLE-CASH SWEEP] Excess cash > 10% NAV buffer"):
+                    updated_state = get_ledger_state()
     refreshed_marks = False
     for t, p in updated_state.get("positions", {}).items():
         if p.get("shares", 0) > 0 and t in price_map:

@@ -81,9 +81,14 @@ _LEGACY_TSX_SECTORS = {
 }
 
 
+SWEEP_ETF = "SPUS"
+
+
 def get_ticker_sector(ticker: str) -> str:
     """Returns canonical sector classification for any Shariah-compliant ticker."""
     norm = normalize_ticker(ticker)
+    if norm == SWEEP_ETF:
+        return "Shariah ETF (Sweep)"
     return SECTOR_MAP.get(norm, _LEGACY_TSX_SECTORS.get(norm, "Other"))
 
 
@@ -569,11 +574,12 @@ def execute_buy(
     In SIMULATED mode: updates local ledger.
     """
     ticker = normalize_ticker(ticker)
+    is_sweep = ticker == SWEEP_ETF
     config = load_config()
     is_live = config.get("trading_mode", "").upper() == "LIVE"
 
-    # Circuit Breaker 1: Strict Shariah Basket Gatekeeper
-    if ticker not in SHARIAH_COMPLIANT_BASKET:
+    # Circuit Breaker 1: Strict Shariah Basket Gatekeeper (SPUS allowed as idle-cash sweep ETF)
+    if not is_sweep and ticker not in SHARIAH_COMPLIANT_BASKET:
         print(f"[MAPLE GATEKEEPER REJECT] {ticker} is NOT in the Shariah-compliant basket! Order blocked.")
         return None
 
@@ -629,7 +635,7 @@ def execute_buy(
         return True
 
     # In SIMULATED mode, maple_trades.csv is the ledger of record; in LIVE mode, reconcile against IBKR positions first
-    if not is_live and not _passes_scale_in_guards():
+    if not is_live and not is_sweep and not _passes_scale_in_guards():
         return None
 
     min_trade_thresh = config.get("min_trade_cad", 50.0)
@@ -661,7 +667,7 @@ def execute_buy(
                 pass
             min_trade_thresh = get_effective_min_trade(config, total_equity)
             max_single_cap = get_effective_order_cap(config, total_equity)
-            if allocated_cash > max_single_cap:
+            if not is_sweep and allocated_cash > max_single_cap:
                 allocated_cash = max_single_cap
 
             ref_nav = _get_reference_nav(config)
@@ -682,11 +688,11 @@ def execute_buy(
             existing_pos = next((p for p in positions_raw if normalize_ticker(p.get("symbol", "")) in aliases or p.get("symbol", "").upper() in aliases), None)
             existing_shares = float(existing_pos.get("openQuantity", 0.0)) if existing_pos else 0.0
             existing_acb = float(existing_pos.get("averageEntryPrice", current_price)) if existing_pos else 0.0
-            if not _passes_scale_in_guards(active_tickers=live_held, fallback_px=existing_acb):
+            if not is_sweep and not _passes_scale_in_guards(active_tickers=live_held, fallback_px=existing_acb):
                 return None
             existing_val = existing_shares * current_price
             max_pos_cad = total_equity * max_pos_pct
-            if existing_val + allocated_cash > max_pos_cad:
+            if not is_sweep and existing_val + allocated_cash > max_pos_cad:
                 allocated_cash = max(0.0, max_pos_cad - existing_val)
                 if allocated_cash < min_trade_thresh:
                     print(f"[MAPLE CONCENTRATION GUARD] {ticker} already at ${existing_val:.2f} ({existing_val/total_equity*100:.1f}% of NAV, cap {max_pos_pct*100:.0f}%). Order blocked.")
@@ -716,7 +722,7 @@ def execute_buy(
 
             sector_exposure = held_sector_cad + pending_sector_cad
             max_sector_cad = total_equity * max_sector_pct
-            if sector_exposure + allocated_cash > max_sector_cad:
+            if not is_sweep and sector_exposure + allocated_cash > max_sector_cad:
                 allocated_cash = max(0.0, max_sector_cad - sector_exposure)
                 if allocated_cash < min_trade_thresh:
                     print(
@@ -760,20 +766,23 @@ def execute_buy(
                 limit_price = round(current_price, 2)
 
             max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
-            shares = _size_whole_shares(
-                ticker,
-                allocated_cash,
-                limit_price,
-                existing_shares,
-                existing_val,
-                total_equity,
-                max_pos_pct,
-                max_single_cap,
-                sector_exposure,
-                max_sector_pct,
-                safe_cash,
-                max_single_share_pct,
-            )
+            if is_sweep:
+                shares = int(min(allocated_cash, safe_cash) // limit_price) if limit_price > 0 else 0
+            else:
+                shares = _size_whole_shares(
+                    ticker,
+                    allocated_cash,
+                    limit_price,
+                    existing_shares,
+                    existing_val,
+                    total_equity,
+                    max_pos_pct,
+                    max_single_cap,
+                    sector_exposure,
+                    max_sector_pct,
+                    safe_cash,
+                    max_single_share_pct,
+                )
             if shares <= 0:
                 print(f"[MAPLE] Price ${limit_price:.2f} exceeds allocated cash ${allocated_cash:.2f} for 1 share.")
                 return None
@@ -825,13 +834,14 @@ def execute_buy(
                 order_note = f"LIVE LIMIT ORDER #{order_id} | {notes}".strip()
                 log_trade(ticker, "BUY", shares, actual_px, new_shares, rem_cash, notes=order_note)
 
-                if "active_targets" not in config:
-                    config["active_targets"] = {}
-                config["active_targets"][ticker] = {
-                    "target_price": target_price,
-                    "stop_loss_price": eff_stop,
-                }
-                save_config(config)
+                if not is_sweep:
+                    if "active_targets" not in config:
+                        config["active_targets"] = {}
+                    config["active_targets"][ticker] = {
+                        "target_price": target_price,
+                        "stop_loss_price": eff_stop,
+                    }
+                    save_config(config)
 
                 try:
                     from telegram_notifier import send_trade_alert
@@ -909,13 +919,13 @@ def execute_buy(
     total_equity = state.get("total_equity", cash)
     min_trade_thresh = get_effective_min_trade(config, total_equity)
     max_single_cap = get_effective_order_cap(config, total_equity)
-    if allocated_cash > max_single_cap:
+    if not is_sweep and allocated_cash > max_single_cap:
         allocated_cash = max_single_cap
     existing_pos = state["positions"].get(ticker, {})
     current_shares = existing_pos.get("shares", 0.0)
     existing_acb = existing_pos.get("acb", current_price)
     existing_val = current_shares * current_price
-    if existing_val + allocated_cash > total_equity * max_pos_pct:
+    if not is_sweep and existing_val + allocated_cash > total_equity * max_pos_pct:
         allocated_cash = max(0.0, total_equity * max_pos_pct - existing_val)
 
     sim_sector_cad = pending_sector_cad + sum(
@@ -923,7 +933,7 @@ def execute_buy(
         for t, p in state["positions"].items()
         if p.get("shares", 0.0) > 0 and get_ticker_sector(t) == target_sector
     )
-    if sim_sector_cad + allocated_cash > total_equity * max_sector_pct:
+    if not is_sweep and sim_sector_cad + allocated_cash > total_equity * max_sector_pct:
         allocated_cash = max(0.0, total_equity * max_sector_pct - sim_sector_cad)
         if allocated_cash < min_trade_thresh:
             print(
@@ -938,20 +948,23 @@ def execute_buy(
         return None
 
     max_single_share_pct = float(config.get("max_single_share_nav_pct", 0.30))
-    shares = _size_whole_shares(
-        ticker,
-        allocated_cash,
-        current_price,
-        current_shares,
-        existing_val,
-        total_equity,
-        max_pos_pct,
-        max_single_cap,
-        sim_sector_cad,
-        max_sector_pct,
-        cash,
-        max_single_share_pct,
-    )
+    if is_sweep:
+        shares = int(allocated_cash // current_price) if current_price > 0 else 0
+    else:
+        shares = _size_whole_shares(
+            ticker,
+            allocated_cash,
+            current_price,
+            current_shares,
+            existing_val,
+            total_equity,
+            max_pos_pct,
+            max_single_cap,
+            sim_sector_cad,
+            max_sector_pct,
+            cash,
+            max_single_share_pct,
+        )
     if shares <= 0:
         return None
     if current_shares > 0 and shares * current_price < min_trade_thresh:
@@ -970,13 +983,14 @@ def execute_buy(
 
     log_trade(ticker, "BUY", shares, current_price, new_shares, new_cash, notes=notes)
 
-    if "active_targets" not in config:
-        config["active_targets"] = {}
-    config["active_targets"][ticker] = {
-        "target_price": target_price,
-        "stop_loss_price": eff_stop,
-    }
-    save_config(config)
+    if not is_sweep:
+        if "active_targets" not in config:
+            config["active_targets"] = {}
+        config["active_targets"][ticker] = {
+            "target_price": target_price,
+            "stop_loss_price": eff_stop,
+        }
+        save_config(config)
 
     print(f"[MAPLE SIMULATED TRADE] BOUGHT {shares} {ticker} @ ${current_price:.2f} | Cash: ${new_cash:.2f}")
     return {
@@ -989,9 +1003,9 @@ def execute_buy(
 
 
 def execute_sell(
-    ticker: str, current_price: float, reason: str = ""
+    ticker: str, current_price: float, reason: str = "", shares_to_sell: Optional[int] = None
 ) -> Optional[Dict[str, Any]]:
-    """Executes a 100% position liquidation.
+    """Executes a 100% (or partial when shares_to_sell is specified) position liquidation.
     In LIVE mode: submits a Marketable Limit Sell Order to IBKR and polls for fill confirmation.
     In SIMULATED mode: updates local ledger.
     """
@@ -1014,10 +1028,12 @@ def execute_sell(
                 print(f"[MAPLE LIVE SELL] No open position for {ticker} found in account #{account_id}.")
                 return None
 
-            shares = int(pos.get("openQuantity", 0))
-            if shares <= 0:
+            open_shares = int(pos.get("openQuantity", 0))
+            if open_shares <= 0:
                 print(f"[MAPLE LIVE SELL] Open shares for {ticker} is 0.")
                 return None
+            shares = min(open_shares, int(shares_to_sell)) if (shares_to_sell and int(shares_to_sell) > 0) else open_shares
+            rem_shares = max(0, open_shares - shares)
 
             symbol_id = pos.get("symbolId")
             if not symbol_id:
@@ -1094,10 +1110,10 @@ def execute_sell(
                 pnl_pct = round((pnl / cost_basis_total) * 100, 2) if cost_basis_total > 0 else 0.0
 
                 order_note = f"LIVE LIMIT SELL #{order_id} FILLED | {reason} | P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)".strip()
-                log_trade(ticker, "SELL", shares, actual_px, 0.0, new_cash, notes=order_note)
+                log_trade(ticker, "SELL", shares, actual_px, float(rem_shares), new_cash, notes=order_note)
 
                 for alias in ticker_aliases(ticker):
-                    if "active_targets" in config and alias in config["active_targets"]:
+                    if rem_shares <= 0 and "active_targets" in config and alias in config["active_targets"]:
                         del config["active_targets"][alias]
                     if "pending_orders" in config and alias in config["pending_orders"]:
                         del config["pending_orders"][alias]
@@ -1175,10 +1191,12 @@ def execute_sell(
     # SIMULATED MODE
     state = get_ledger_state()
     pos = state["positions"].get(ticker, {})
-    shares = pos.get("shares", 0.0)
+    open_shares = pos.get("shares", 0.0)
 
-    if shares <= 0:
+    if open_shares <= 0:
         return None
+    shares = min(open_shares, float(int(shares_to_sell))) if (shares_to_sell and int(shares_to_sell) > 0) else open_shares
+    rem_shares = round(max(0.0, open_shares - shares), 4)
 
     proceeds = round(shares * current_price, 2)
     sim_comm = float(config.get("commission_per_order_cad", 0.0))
@@ -1189,12 +1207,13 @@ def execute_sell(
     pnl_pct = round((pnl / cost_basis_total) * 100, 2) if cost_basis_total > 0 else 0.0
 
     notes = f"{reason} | P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)"
-    log_trade(ticker, "SELL", shares, current_price, 0.0, new_cash, notes=notes.strip())
+    log_trade(ticker, "SELL", shares, current_price, rem_shares, new_cash, notes=notes.strip())
 
-    for alias in ticker_aliases(ticker):
-        if "active_targets" in config and alias in config["active_targets"]:
-            del config["active_targets"][alias]
-    save_config(config)
+    if rem_shares <= 0:
+        for alias in ticker_aliases(ticker):
+            if "active_targets" in config and alias in config["active_targets"]:
+                del config["active_targets"][alias]
+        save_config(config)
 
     print(f"[MAPLE SIMULATED TRADE] SOLD {shares} {ticker} @ ${current_price:.2f} ({notes}) | Cash: ${new_cash:.2f}")
     return {
@@ -1580,7 +1599,7 @@ def check_target_stops(
     for raw_ticker, pos in state["positions"].items():
         ticker = normalize_ticker(raw_ticker)
         shares = pos.get("shares", 0.0)
-        if shares <= 0:
+        if shares <= 0 or ticker == SWEEP_ETF:
             continue
 
         price = None

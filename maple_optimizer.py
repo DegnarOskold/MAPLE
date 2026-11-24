@@ -27,7 +27,7 @@ CHANGELOG_FILE = os.path.join(MAPLE_DIR, "maple_logic_changelog.md")
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
 TRADES_FILE = os.path.join(MAPLE_DIR, "maple_trades.csv")
 
-from maple_market import get_stock_data, get_corporate_calendar, prefetch_histories
+from maple_market import get_stock_data, get_corporate_calendar, prefetch_histories, get_macro_alignment, is_macro_aligned
 from maple_ledger import (
     load_config,
     save_config,
@@ -40,6 +40,7 @@ from maple_ledger import (
     get_position_holding_days,
     get_position_last_buy_info,
     normalize_ticker,
+    SWEEP_ETF,
 )
 from maple_strategy import MapleStrategy
 
@@ -308,34 +309,35 @@ def calculate_position_attribution(
         }
         attribution.append(item)
 
-        # Flag for risk watchlist if:
+        # Flag for risk watchlist if (skip passive idle-cash sweep ETF):
         # 1. Unrealized loss > 1.5%
         # 2. Distance to stop is within 3.0%
         # 3. Position concentration > 25% with negative P&L
         # 4. Held >= STAGNATION_DAYS with negative P&L
         notes = []
-        if unrealized_pct <= -1.5:
-            notes.append(f"Position drawdown: {unrealized_pct:.1f}%")
-        if dist_to_stop_pct <= 3.0:
-            notes.append(f"Near stop-loss: {dist_to_stop_pct:.1f}% buffer")
-        if weight_pct >= 25.0 and unrealized < 0:
-            notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
-        if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
-            sd = (stock_data_map or {}).get(normalize_ticker(sym), {})
-            ema_5 = sd.get("EMA_5")
-            ema_9 = sd.get("EMA_9")
-            ema_cross = str(sd.get("EMA_Crossover", ""))
-            has_ema = isinstance(ema_5, (int, float)) and isinstance(ema_9, (int, float))
-            is_bearish = (has_ema and ema_5 < ema_9) or ("BEARISH" in ema_cross.upper())
-            below_both_emas = has_ema and cur_p < ema_5 and cur_p < ema_9
-            if (has_ema or ema_cross) and not (is_bearish or below_both_emas):
-                notes.append(
-                    f"Held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d) at {unrealized_pct:.1f}% — retained (Bullish EMA5 > EMA9)"
-                )
-            else:
-                notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
-        elif days_held == MapleStrategy.STAGNATION_DAYS - 1 and unrealized < 0:
-            notes.append(f"Approaching Day-{MapleStrategy.STAGNATION_DAYS} stagnation check tomorrow ({days_held}d held)")
+        if normalize_ticker(sym) != SWEEP_ETF:
+            if unrealized_pct <= -1.5:
+                notes.append(f"Position drawdown: {unrealized_pct:.1f}%")
+            if dist_to_stop_pct <= 3.0:
+                notes.append(f"Near stop-loss: {dist_to_stop_pct:.1f}% buffer")
+            if weight_pct >= 25.0 and unrealized < 0:
+                notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
+            if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
+                sd = (stock_data_map or {}).get(normalize_ticker(sym), {})
+                ema_5 = sd.get("EMA_5")
+                ema_9 = sd.get("EMA_9")
+                ema_cross = str(sd.get("EMA_Crossover", ""))
+                has_ema = isinstance(ema_5, (int, float)) and isinstance(ema_9, (int, float))
+                is_bearish = (has_ema and ema_5 < ema_9) or ("BEARISH" in ema_cross.upper())
+                below_both_emas = has_ema and cur_p < ema_5 and cur_p < ema_9
+                if (has_ema or ema_cross) and not (is_bearish or below_both_emas):
+                    notes.append(
+                        f"Held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d) at {unrealized_pct:.1f}% — retained (Bullish EMA5 > EMA9)"
+                    )
+                else:
+                    notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
+            elif days_held == MapleStrategy.STAGNATION_DAYS - 1 and unrealized < 0:
+                notes.append(f"Approaching Day-{MapleStrategy.STAGNATION_DAYS} stagnation check tomorrow ({days_held}d held)")
 
         cal_info = (calendar_map or {}).get(normalize_ticker(sym), {})
         earn_td = cal_info.get("trading_days_to_earnings")
@@ -358,6 +360,7 @@ def calculate_position_attribution(
 def scan_missed_opportunities(
     allowed_tickers: List[str],
     prefetched: Optional[Dict[str, Any]] = None,
+    macro_state: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Identifies stocks that gained > 2.0% today or from low of day that MAPLE did not hold,
     filtering out overextended, non-trending, or structurally rejected setups.
@@ -386,11 +389,21 @@ def scan_missed_opportunities(
 
             if day_gain >= 2.0 or (day_gain > 0 and pct_from_low >= 2.5):
                 tranche_pct, gate_reason = MapleStrategy.calculate_tranche_size(data)
-                gate_status = (
-                    f"ELIGIBLE ({tranche_pct*100:.0f}%)"
-                    if tranche_pct > 0.0
-                    else gate_reason.replace("BLOCKED by ", "").split(" (requires")[0][:130]
-                )
+                eligible = tranche_pct > 0.0
+                if eligible:
+                    gate_status = f"ELIGIBLE ({tranche_pct*100:.0f}%)"
+                    if macro_state:
+                        aligned, macro_reason = is_macro_aligned(ticker, macro_state)
+                        if not aligned:
+                            eligible = False
+                            gate_status = f"Macro Filter: {macro_reason}"
+                        elif macro_state.get("SPY_BELOW_SMA50", False) and (
+                            "Capitulation" in gate_reason or "Single-Bypass Rule" in gate_reason
+                        ):
+                            eligible = False
+                            gate_status = "Macro Filter: S&P 500 (SPY) below 50-SMA"
+                else:
+                    gate_status = gate_reason.replace("BLOCKED by ", "").split(" (requires")[0][:130]
                 missed.append({
                     "ticker": ticker,
                     "day_gain": round(day_gain, 2),
@@ -399,7 +412,7 @@ def scan_missed_opportunities(
                     "vol_ratio": data.get("Vol_Ratio", "N/A"),
                     "adx": data.get("ADX_14", "N/A"),
                     "ema_crossover": data.get("EMA_Crossover", "N/A"),
-                    "eligible": tranche_pct > 0.0,
+                    "eligible": eligible,
                     "gate_status": gate_status,
                 })
         except Exception:
@@ -507,7 +520,7 @@ def run_daily_self_assessment():
     cap_buys = sum(1 for b in buy_trades if b["bucket"] == "Capitulation Reversal")
 
     # 4. Missed Opportunities
-    missed = scan_missed_opportunities(norm_allowed, prefetched=prefetched)
+    missed = scan_missed_opportunities(norm_allowed, prefetched=prefetched, macro_state=get_macro_alignment())
     changes_made = []
     audit_flags = []
     if abs(day_flows) >= 1.0:
@@ -524,6 +537,8 @@ def run_daily_self_assessment():
             )
 
     for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
+        if sec == "Shariah ETF (Sweep)":
+            continue
         sec_pct = (val / equity * 100.0) if equity > 0 else 0.0
         if sec_pct > max_sector_pct:
             audit_flags.append(
@@ -628,7 +643,7 @@ def run_daily_self_assessment():
         report.append("\n**Sector Exposure Breakdown (Cap 35.0%):**")
         for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
             sec_pct = (val / equity) * 100.0
-            breach_tag = " ⚠️ [OVER 35% CAP]" if sec_pct > max_sector_pct else ""
+            breach_tag = " ⚠️ [OVER 35% CAP]" if (sec != "Shariah ETF (Sweep)" and sec_pct > max_sector_pct) else ""
             report.append(f"- **{sec}**: USD {val:.2f} (`{sec_pct:.1f}%` of NAV){breach_tag}")
 
     if buy_trades:

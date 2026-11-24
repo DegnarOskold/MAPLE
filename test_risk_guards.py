@@ -872,6 +872,39 @@ def run_checks():
     )
     assert [s["ticker"] for s in cap_above_spy] == ["NKE"], f"Capitulation Reversal should pass when SPY >= 50-SMA: {cap_above_spy}"
 
+    elev_sigs = maple_brain.evaluate_autonomous_signals(
+        rank_mkt, {"AAPL"}, macro_state={"GC=F": True, "CL=F": True, "VIX_ELEVATED": True, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
+    )
+    calm_sigs = maple_brain.evaluate_autonomous_signals(
+        rank_mkt, {"AAPL"}, macro_state={"GC=F": True, "CL=F": True, "VIX_ELEVATED": False, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
+    )
+    assert len(elev_sigs) == 1 and elev_sigs[0]["tranche_pct"] == round(calm_sigs[0]["tranche_pct"] * 0.5, 4) and "0.5x VIX Elevated" in elev_sigs[0]["rationale"], f"VIX_ELEVATED half-size failed: {elev_sigs}"
+
+    with patch.object(maple_optimizer, "get_ledger_state", return_value={"positions": {}}), \
+         patch.object(maple_optimizer, "get_stock_data", return_value={"Price": 170.59, "Prev_Close": 166.43, "Open": 167.21, "Pct_From_Low": 2.16, "RSI_7": 61.03, "Vol_Ratio": 1.31, "ADX_14": 30.4, "EMA_5": 168.58, "EMA_9": 168.36, "SMA_50": 157.74, "EMA_Crossover": "BULLISH (EMA5 > EMA9)"}):
+        vix_movers = maple_optimizer.scan_missed_opportunities(["GILD"], macro_state={"VIX_PANIC": True})
+        assert len(vix_movers) == 1 and vix_movers[0]["eligible"] is False and "Macro Filter" in vix_movers[0]["gate_status"], f"VIX-blocked mover falsely marked eligible: {vix_movers}"
+
+    # 29. Idle-Cash SPUS Sweep: bypasses 35% cap & stop-loss, supports partial unwind
+    with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "max_position_pct": 0.35, "max_sector_pct": 0.35, "pending_orders": {}, "active_targets": {}}), \
+         patch.object(maple_ledger, "save_config") as mock_save, \
+         patch.object(maple_ledger, "get_ledger_state", return_value={"cash": 8000.0, "total_equity": 9000.0, "positions": {}}), \
+         patch.object(maple_ledger, "log_trade"):
+        sp_buy = maple_ledger.execute_buy("SPUS", 7000.0, 50.0, notes="[IDLE-CASH SWEEP]")
+        assert sp_buy is not None and sp_buy["shares"] == 140 and mock_save.call_count == 0, f"SPUS sweep buy failed: {sp_buy}"
+    with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "pending_orders": {}, "active_targets": {}}), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_ledger_state", return_value={"cash": 1000.0, "total_equity": 8000.0, "positions": {"SPUS": {"shares": 140.0, "acb": 50.0}}}), \
+         patch.object(maple_ledger, "log_trade") as mock_log:
+        sp_sell = maple_ledger.execute_sell("SPUS", 51.0, reason="Sweep Unwind", shares_to_sell=30)
+        assert sp_sell is not None and sp_sell["shares"] == 30 and mock_log.call_args[0][4] == 110.0, f"SPUS partial unwind failed: {sp_sell}"
+    with patch.object(maple_ledger, "sync_working_orders"), \
+         patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "active_targets": {}, "initial_portfolio": {}}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value={"cash": 1000.0, "total_equity": 7000.0, "positions": {"SPUS": {"shares": 140.0, "acb": 50.0}}}), \
+         patch.object(maple_ledger, "execute_sell") as mock_stop_sell:
+        maple_ledger.check_target_stops({"SPUS": 40.0})
+        assert mock_stop_sell.call_count == 0, "check_target_stops should never stop out SPUS sweep ETF"
+
     import maple_backtest
     assert callable(maple_backtest.run_backtest) and maple_backtest.run_backtest({})["trades"] == 0
 
