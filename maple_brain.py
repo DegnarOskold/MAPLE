@@ -25,12 +25,16 @@ from maple_market import (
     prefetch_histories,
     get_macro_alignment,
     is_macro_aligned,
+    now_et_naive,
+    is_nyse_trading_day,
+    get_nyse_close_hour_min,
     GOLD_LINKED_TICKERS,
     OIL_LINKED_TICKERS,
 )
 from maple_ledger import (
     get_ledger_state,
     get_effective_order_cap,
+    get_effective_min_trade,
     preflight_buy,
     execute_buy,
     execute_sell,
@@ -46,28 +50,61 @@ from maple_strategy import MapleStrategy
 
 
 def is_market_open() -> bool:
-    """Checks if US equities (NYSE/NASDAQ) are in regular trading hours (09:30 - 16:00 ET Mon-Fri)."""
-    now = datetime.datetime.now()
-    if now.weekday() >= 5:  # Saturday or Sunday
+    """Checks if US equities (NYSE/NASDAQ) are in regular trading hours (ET, respecting NYSE holidays & early closes)."""
+    now = now_et_naive()
+    if not is_nyse_trading_day(now.date()):
         return False
+    close_h, close_m = get_nyse_close_hour_min(now.date())
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    market_close = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
     return market_open <= now <= market_close
 
 
 def is_opening_chop() -> bool:
     """Rule 3 Guard: Checks if US equities are in the volatile opening 30-min window (09:30 - 10:00 ET)."""
-    now = datetime.datetime.now()
-    if now.weekday() >= 5:
+    now = now_et_naive()
+    if not is_nyse_trading_day(now.date()):
         return False
     chop_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
     chop_end = now.replace(hour=10, minute=0, second=0, microsecond=0)
     return chop_start <= now < chop_end
 
 
+def is_eod_exit_window() -> bool:
+    """True during the final 25 minutes before NYSE close (15:35-16:00 ET regular, 12:35-13:00 ET early close)."""
+    now = now_et_naive()
+    if not is_nyse_trading_day(now.date()):
+        return False
+    close_h, close_m = get_nyse_close_hour_min(now.date())
+    close_dt = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+    return (close_dt - datetime.timedelta(minutes=25)) <= now <= close_dt
+
+
+def rank_universe_by_rs(
+    market_data: Dict[str, Dict[str, Any]],
+    allowed_tickers: set,
+) -> List[str]:
+    """Ranks universe tickers descending by composite RS_Score (0.50*Ret_63d + 0.35*Ret_126d + 0.15*Ret_20d)."""
+    scored = []
+    for raw_t in allowed_tickers:
+        t = normalize_ticker(raw_t)
+        sd = market_data.get(t)
+        if not sd:
+            continue
+        rs = sd.get("RS_Score")
+        if not isinstance(rs, (int, float)):
+            r63 = float(sd["Ret_63d"]) if isinstance(sd.get("Ret_63d"), (int, float)) else 0.0
+            r126 = float(sd["Ret_126d"]) if isinstance(sd.get("Ret_126d"), (int, float)) else r63
+            r20 = float(sd["Ret_20d"]) if isinstance(sd.get("Ret_20d"), (int, float)) else 0.0
+            rs = round(0.50 * r63 + 0.35 * r126 + 0.15 * r20, 2)
+        scored.append((float(rs), t))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [t for _, t in scored]
+
+
 def log_maple_advice(text: str):
     advice_path = os.path.join(MAPLE_DIR, "maple_advice_history.txt")
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = now_et_naive().strftime("%Y-%m-%d %H:%M:%S")
     with open(advice_path, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}]\n{text}\n\n")
 
@@ -235,14 +272,68 @@ def parse_bot_signals(bot_advice_text: str) -> List[Dict[str, Any]]:
 def evaluate_autonomous_signals(
     market_data: Dict[str, Dict[str, Any]],
     allowed_tickers: set,
-    macro_state: Optional[Dict[str, bool]] = None,
+    macro_state: Optional[Dict[str, Any]] = None,
     max_share_price: Optional[float] = None,
     held_tickers: Optional[set] = None,
+    strategy_mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Directly scans all 47 Shariah-compliant US tickers for Trend Momentum and Capitulation Reversal setups."""
+    """Scans the 53 Shariah-compliant US tickers under Variant D (STAGE2_RS) or tactical swing rules."""
     MapleStrategy._sync_from_config()
     candidates = []
     held_norm = {normalize_ticker(t) for t in held_tickers} if held_tickers else set()
+
+    if str(strategy_mode or "").upper() == "STAGE2_RS":
+        non_sweep_held = {t for t in held_norm if t != SWEEP_ETF}
+        if len(non_sweep_held) >= MapleStrategy.MAX_OPEN_POSITIONS:
+            return []
+        ranked_rs = rank_universe_by_rs(market_data, allowed_tickers)
+        top_rs_list = ranked_rs[: MapleStrategy.RS_TOP_N]
+        vix_blocked = bool(macro_state and (macro_state.get("VIX_STAGE2_BLOCK", False) or macro_state.get("VIX_PANIC", False)))
+        spy_bear = bool(macro_state and macro_state.get("SPY_BELOW_SMA50", False) and macro_state.get("SPY_BELOW_SMA200", False))
+
+        for ticker in top_rs_list:
+            if ticker not in SHARIAH_COMPLIANT_BASKET or ticker in held_norm:
+                continue
+            sd = market_data.get(ticker)
+            if not sd or not isinstance(sd.get("Price"), (int, float)) or sd["Price"] <= 0:
+                continue
+            if max_share_price and max_share_price > 0 and sd["Price"] > max_share_price:
+                continue
+            aligned, macro_reason = is_macro_aligned(ticker, macro_state)
+            if not aligned:
+                print(f"[MAPLE MACRO FILTER] {ticker} (STAGE2_RS): Suppressed - {macro_reason}")
+                continue
+            if ticker not in GOLD_LINKED_TICKERS and ticker not in OIL_LINKED_TICKERS:
+                if vix_blocked:
+                    print(f"[MAPLE MACRO FILTER] {ticker} (STAGE2_RS): Suppressed - VIX >= 32 stress regime")
+                    continue
+                if spy_bear:
+                    print(f"[MAPLE MACRO FILTER] {ticker} (STAGE2_RS): Suppressed - SPY below both 50-SMA and 200-SMA")
+                    continue
+
+            tranche_pct, rationale = MapleStrategy.evaluate_stage2_entry(sd)
+            if tranche_pct <= 0.0:
+                print(f"[MAPLE FILTER] {ticker} (STAGE2_RS): {rationale}")
+                continue
+            if (
+                macro_state
+                and macro_state.get("VIX_ELEVATED", False)
+                and macro_state.get("SPY_BELOW_SMA50", False)
+                and ticker not in GOLD_LINKED_TICKERS
+                and ticker not in OIL_LINKED_TICKERS
+            ):
+                tranche_pct = round(tranche_pct * 0.60, 4)
+                rationale = f"{rationale}, 0.6x Defensive Regime"
+            candidates.append(
+                {
+                    "action": "BUY",
+                    "ticker": ticker,
+                    "signal_type": "STAGE2_RS",
+                    "tranche_pct": tranche_pct,
+                    "rationale": rationale,
+                }
+            )
+        return candidates
 
     for raw_t in sorted(allowed_tickers):
         ticker = normalize_ticker(raw_t)
@@ -308,12 +399,14 @@ def evaluate_autonomous_signals(
 
         vr_val = float(vol_ratio) if isinstance(vol_ratio, (int, float)) else 0.0
         adx_val = float(sd.get("ADX_14")) if isinstance(sd.get("ADX_14"), (int, float)) else 0.0
+        ret_63d = sd.get("Ret_63d")
         ret_20d = sd.get("Ret_20d")
-        rank_tuple = (
-            (tranche_pct, round(vr_val, 2), float(ret_20d), adx_val)
-            if isinstance(ret_20d, (int, float))
-            else (tranche_pct, vr_val, adx_val)
-        )
+        if isinstance(ret_63d, (int, float)):
+            rank_tuple = (tranche_pct, float(ret_63d), round(vr_val, 2), adx_val)
+        elif isinstance(ret_20d, (int, float)):
+            rank_tuple = (tranche_pct, round(vr_val, 2), float(ret_20d), adx_val)
+        else:
+            rank_tuple = (tranche_pct, vr_val, adx_val)
         candidates.append(
             {
                 "action": "BUY",
@@ -336,10 +429,22 @@ def run_chop_exit_guard() -> Dict[str, Any]:
     Scans ONLY held assets for profit targets or stop-loss hits to harvest algorithmic spikes.
     Zero buy orders permitted under Rule 3.
     """
-    now_str = datetime.datetime.now().strftime("%H:%M:%S")
+    now_str = now_et_naive().strftime("%H:%M:%S")
     print(f"\n[MAPLE CHOP EXIT GUARD STARTED] {now_str} ET")
 
+    config = load_config()
+    is_live = config.get("trading_mode", "").upper() == "LIVE"
     state = get_ledger_state()
+    if is_live and state.get("live_fallback"):
+        err = state.get("live_error", "Broker gateway unauthenticated/unreachable")
+        print(f"[MAPLE LIVE HALT] Chop Guard aborted — live broker state unverified: {err}")
+        try:
+            from telegram_notifier import send_circuit_breaker_alert
+            send_circuit_breaker_alert("IBKR Gateway Unreachable (Chop Guard)", err)
+        except Exception:
+            pass
+        return {"status": "BROKER_UNAVAILABLE", "action": "NONE"}
+
     held_positions = {
         normalize_ticker(t): p
         for t, p in state.get("positions", {}).items()
@@ -353,8 +458,6 @@ def run_chop_exit_guard() -> Dict[str, Any]:
     tickers = list(held_positions.keys())
     print(f"[MAPLE CHOP GUARD] Monitoring held assets for algorithmic liquidity spikes: {', '.join(tickers)}")
 
-    config = load_config()
-    is_live = config.get("trading_mode", "").upper() == "LIVE"
     price_map = {}
     chop_mkt = {}
 
@@ -420,7 +523,7 @@ def run_chop_exit_guard() -> Dict[str, Any]:
     # Evaluate target and opening-chop buffered stop triggers
     check_target_stops(price_map, market_data=chop_mkt, is_chop_window=True)
 
-    print(f"[MAPLE CHOP EXIT GUARD COMPLETE] {datetime.datetime.now().strftime('%H:%M:%S')} ET\n")
+    print(f"[MAPLE CHOP EXIT GUARD COMPLETE] {now_et_naive().strftime('%H:%M:%S')} ET\n")
     return {"status": "SUCCESS", "monitored": tickers}
 
 
@@ -434,35 +537,63 @@ def run_intraday_scan(bot_advice: str = ""):
         return run_chop_exit_guard()
 
     allowed_tickers = set(normalize_ticker(t) for t in config.get("allowed_tickers", []))
+    market_active = is_market_open()
     ledger_state = get_ledger_state()
+    if is_live and ledger_state.get("live_fallback"):
+        err = ledger_state.get("live_error", "Broker gateway unauthenticated/unreachable")
+        print(f"\n[MAPLE LIVE HALT] {now_et_naive().strftime('%Y-%m-%d %H:%M:%S')} - Aborting scan; live broker state unverified: {err}")
+        if market_active:
+            try:
+                from telegram_notifier import send_circuit_breaker_alert
+                send_circuit_breaker_alert("IBKR Gateway Unreachable", f"{err} — live stops & scans paused until reconnected.")
+            except Exception:
+                pass
+        return {"status": "BROKER_UNAVAILABLE", "error": err}
 
-    print(f"\n[MAPLE SCAN STARTED] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n[MAPLE SCAN STARTED] {now_et_naive().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Mode: {ledger_state.get('mode', 'SIMULATED')} | Available Cash: ${ledger_state['cash']:.2f}")
 
-    market_active = is_market_open()
     if not market_active and is_live:
-        print("[MAPLE NOTICE] US equity market is currently outside regular trading hours (9:30 AM - 4:00 PM ET).")
+        print("[MAPLE NOTICE] US equity market is currently outside regular trading hours.")
 
-    # Step 1: Fetch live prices
-    market_data = fetch_latest_market_prices(list(allowed_tickers))
+    # Step 1: Fetch live prices for allowed universe PLUS any held positions (and sweep ETF when active)
+    held_open = {
+        normalize_ticker(t)
+        for t, p in ledger_state.get("positions", {}).items()
+        if float(p.get("shares", 0) or 0) > 0
+    }
+    fetch_universe = set(allowed_tickers) | held_open
+    if config.get("idle_cash_sweep", False):
+        fetch_universe.add(SWEEP_ETF)
+    market_data = fetch_latest_market_prices(sorted(fetch_universe))
     price_map = {
         t: d["Price"]
         for t, d in market_data.items()
         if isinstance(d.get("Price"), (int, float))
     }
 
-    # Step 2: Auto Target, Stop-Loss, Breakeven Ratchet & Stagnation Exit Check (Intraday execution)
-    print("Checking automatic profit targets, stop-losses, breakeven ratchets, and 4-day stagnation exits...")
-    check_target_stops(
-        price_map,
-        market_data=market_data,
-        allow_stagnation_exit=(market_active or not is_live) and not is_opening_chop(),
-    )
+    # Step 2: Auto Target, Stop-Loss, Ratchet & Stage-2 Trend Exit Check
+    MapleStrategy._sync_from_config()
+    strategy_mode = str(config.get("strategy_mode", "")).upper()
+    ranked_rs_all = rank_universe_by_rs(market_data, allowed_tickers) if strategy_mode == "STAGE2_RS" else []
+    keep_rs_set = set(ranked_rs_all[: MapleStrategy.RS_KEEP_N]) if ranked_rs_all else None
+    print("Checking protective stops, ratchets, and Stage-2 trend exits...")
+    stop_kwargs: Dict[str, Any] = {
+        "market_data": market_data,
+        "allow_stagnation_exit": (market_active or not is_live) and not is_opening_chop(),
+    }
+    if strategy_mode == "STAGE2_RS":
+        stop_kwargs["is_eod_window"] = (is_eod_exit_window() or not is_live) and not is_opening_chop()
+        stop_kwargs["top_keep_tickers"] = keep_rs_set
+    check_target_stops(price_map, **stop_kwargs)
 
-    # Step 3: Evaluate autonomous 47-ticker candidate setups (or explicit CLI override text)
+    # Step 3: Evaluate autonomous 53-ticker candidate setups (or explicit CLI override text)
     # Refresh config & ledger_state after Step 2 exits so newly freed cash and closed positions are reflected in Step 3.
     config = load_config()
+    strategy_mode = str(config.get("strategy_mode", "")).upper()
     ledger_state = get_ledger_state()
+    if is_live and ledger_state.get("live_fallback"):
+        return {"status": "BROKER_UNAVAILABLE", "error": ledger_state.get("live_error", "")}
     if bot_advice:
         signals = parse_bot_signals(bot_advice)
         print(f"Extracted {len(signals)} explicit signal(s) from CLI input.")
@@ -475,11 +606,17 @@ def run_intraday_scan(bot_advice: str = ""):
             nav_est * max(float(config.get("max_position_pct", 0.25)), float(config.get("max_single_share_nav_pct", 0.30))),
         )
         held_set = {normalize_ticker(t) for t, p in ledger_state.get("positions", {}).items() if p.get("shares", 0) > 0}
-        signals = evaluate_autonomous_signals(
-            market_data, allowed_tickers, macro_state=macro_state, max_share_price=max_share_px, held_tickers=held_set
-        )
+        eval_kw: Dict[str, Any] = {
+            "macro_state": macro_state,
+            "max_share_price": max_share_px,
+            "held_tickers": held_set,
+        }
+        if strategy_mode == "STAGE2_RS":
+            eval_kw["strategy_mode"] = "STAGE2_RS"
+        signals = evaluate_autonomous_signals(market_data, allowed_tickers, **eval_kw)
+        eval_count = sum(1 for t in allowed_tickers if t in market_data)
         print(
-            f"Evaluated {len(market_data)}/{len(allowed_tickers)} Shariah-compliant US tickers -> "
+            f"Evaluated {eval_count}/{len(allowed_tickers)} Shariah-compliant US tickers -> "
             f"{len(signals)} actionable signal(s) (Macro: GC=F={'UP' if macro_state.get('GC=F', True) else 'DOWN'}, "
             f"CL=F={'UP' if macro_state.get('CL=F', True) else 'DOWN'}, "
             f"VIX={'PANIC' if macro_state.get('VIX_PANIC', False) else ('ELEVATED(0.5x)' if macro_state.get('VIX_ELEVATED', False) else 'CALM')})."
@@ -545,7 +682,19 @@ def run_intraday_scan(bot_advice: str = ""):
                     if sweep_px > 0:
                         price_map[SWEEP_ETF] = sweep_px
                 avail_funds = curr_cash + (sweep_shs * sweep_px if (sweep_shs > 0 and sweep_px > 0) else 0.0)
-                allocated = round(min(avail_funds, curr_nav * tranche_pct), 2)
+                target_alloc = curr_nav * tranche_pct
+                risk_per_trade = float(config.get("risk_per_trade_pct", 0.0))
+                if str(sig_type).upper() != "STAGE2_RS" and risk_per_trade > 0 and current_price > 0:
+                    _, init_stp_est = MapleStrategy.calculate_targets(
+                        current_price, stock_info, shares=1.0, cost_basis=current_price, signal_type=sig_type
+                    )
+                    stp_frac = max(0.03, (current_price - init_stp_est) / current_price)
+                    rp_eff = risk_per_trade * (0.5 if "0.5x VIX Elevated" in rationale else 1.0)
+                    if "CAPITULATION" in sig_type.upper() or "LOW-VOLUME" in sig_type.upper() or "SCALED" in sig_type.upper():
+                        rp_eff *= 0.75
+                    max_pos_usd = curr_nav * float(config.get("max_position_pct", 0.25))
+                    target_alloc = min(max_pos_usd, (curr_nav * rp_eff) / stp_frac)
+                allocated = round(min(avail_funds, target_alloc), 2)
                 buy_notes = f"[{sig_type}] Dynamic Tranche {tranche_pct*100:.1f}% ({rationale})"
                 approved_alloc = preflight_buy(
                     ticker,
@@ -557,20 +706,31 @@ def run_intraday_scan(bot_advice: str = ""):
                 if approved_alloc <= 0.0:
                     continue
                 allocated = round(approved_alloc, 2)
+                min_trade_req = get_effective_min_trade(config, curr_nav)
                 free_cash = max(0.0, curr_cash - (20.0 if is_live else 0.0))
                 if allocated > free_cash and sweep_shs > 0 and sweep_px > 0:
-                    need_shs = min(sweep_shs, math.ceil((allocated - free_cash + 2.0) / sweep_px))
+                    eff_unwind_px = sweep_px * 0.995
+                    if free_cash + (sweep_shs * eff_unwind_px) < min_trade_req:
+                        print(f"[MAPLE SWEEP UNWIND] Skipping {SWEEP_ETF} unwind for {ticker}: total liquidity below ${min_trade_req:.2f} min trade.")
+                        continue
+                    need_shs = min(sweep_shs, math.ceil((allocated - free_cash + 2.0) / eff_unwind_px))
                     if need_shs > 0:
                         print(f"[MAPLE SWEEP UNWIND] Selling {need_shs} {SWEEP_ETF} @ ~${sweep_px:.2f} to fund {ticker} BUY...")
                         unwind_res = execute_sell(SWEEP_ETF, sweep_px, reason=f"Sweep Unwind for {ticker} BUY", shares_to_sell=need_shs)
                         if unwind_res and unwind_res.get("action") == "SELL":
                             curr_state = get_ledger_state()
                             curr_cash = curr_state["cash"]
-                            allocated = round(min(curr_cash, allocated), 2)
+                            eff_avail = max(0.0, curr_cash - (20.0 if is_live else 0.0)) if is_live else curr_cash
+                            allocated = round(min(eff_avail, allocated), 2)
                         else:
-                            allocated = round(min(curr_cash, allocated), 2)
+                            eff_avail = free_cash if is_live else curr_cash
+                            allocated = round(min(eff_avail, allocated), 2)
+                            if allocated < min_trade_req:
+                                print(f"[MAPLE SWEEP UNWIND] Deferring {ticker} BUY until {SWEEP_ETF} sell order fills.")
+                                continue
                 else:
-                    allocated = round(min(curr_cash, allocated), 2)
+                    eff_avail = free_cash if is_live else curr_cash
+                    allocated = round(min(eff_avail, allocated), 2)
                 raw_shs = allocated / current_price
                 estimated_shares = int(raw_shs) + (1 if int(raw_shs) >= 1 and (raw_shs - int(raw_shs)) >= 0.5 and (int(raw_shs) + 1) * current_price <= allocated * 1.15 else 0)
                 estimated_shares = max(1, estimated_shares)
@@ -585,8 +745,9 @@ def run_intraday_scan(bot_advice: str = ""):
                     current_price, stock_info, shares=tot_est_shares, cost_basis=est_basis, signal_type=sig_type
                 )
 
+                tgt_lbl = f"${target:.2f}" if isinstance(target, (int, float)) else "UNCAPPED (Stage-2 Trail)"
                 print(
-                    f"[MAPLE SIZING] {ticker}: {tranche_pct*100:.1f}% tranche (${allocated:.2f}, ~{estimated_shares} shs) | Target: ${target:.2f} | Stop: ${stop:.2f} | Logic: {rationale}"
+                    f"[MAPLE SIZING] {ticker}: {tranche_pct*100:.1f}% tranche (${allocated:.2f}, ~{estimated_shares} shs) | Target: {tgt_lbl} | Stop: ${stop:.2f} | Logic: {rationale}"
                 )
                 execute_buy(
                     ticker,
@@ -596,6 +757,8 @@ def run_intraday_scan(bot_advice: str = ""):
                     stop_loss_price=stop,
                     notes=f"[{sig_type}] Dynamic Tranche {tranche_pct*100:.1f}% ({rationale})",
                     open_price=stock_info.get("Open"),
+                    stock_data=stock_info,
+                    signal_type=sig_type,
                 )
 
         log_maple_advice("Processed Autonomous Signals:\n" + json.dumps(signals, indent=2))
@@ -603,9 +766,14 @@ def run_intraday_scan(bot_advice: str = ""):
     # Output current portfolio equity using real-time price_map marks when available
     updated_state = get_ledger_state()
 
-    # Idle-Cash Sweep: park excess cash (> 20% NAV buffer) into SPUS near market close (15:30-15:50 ET)
-    now_sweep = datetime.datetime.now()
-    in_sweep_window = (now_sweep.hour == 15 and 30 <= now_sweep.minute <= 50)
+    # Idle-Cash Sweep: park excess cash (> 20% NAV buffer) into SPUS 10-30 min before NYSE close
+    now_sweep = now_et_naive()
+    close_h, close_m = get_nyse_close_hour_min(now_sweep.date())
+    close_dt = now_sweep.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+    in_sweep_window = (
+        is_nyse_trading_day(now_sweep.date())
+        and (close_dt - datetime.timedelta(minutes=30)) <= now_sweep <= (close_dt - datetime.timedelta(minutes=10))
+    )
     if (
         config.get("idle_cash_sweep", False)
         and (market_active or not is_live)

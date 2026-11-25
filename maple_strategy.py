@@ -44,14 +44,28 @@ class MapleStrategy:
     # Stop Loss & Profit Target Heuristics
     STOP_LOSS_PCT = 5.0
     MIN_STOP_LOSS_PCT = 3.25
+    MIN_ATR14_STOP_PCT = 3.0
+    MAX_ATR14_STOP_PCT = 7.5
     ATR_STOP_MULTIPLIER = 2.2
     HALF_RISK_TRIGGER_PCT = 2.0
     BREAKEVEN_TRIGGER_PCT = 2.5
     CAPITULATION_TARGET_PCT = 3.5
     ATR_TARGET_MULTIPLIER = 1.5
+    ATR14_TARGET_MULTIPLIER = 2.5
     STAGNATION_DAYS = 4
     COMMISSION_PER_ORDER_CAD = 1.00
     MIN_NET_PROFIT_PCT = 2.5
+
+    # Variant D: Stage-2 Top-RS Multi-Week Swing Parameters
+    STAGE2_HARD_STOP_ATR_MULT = 2.8
+    STAGE2_TRAIL_STOP_ATR_MULT = 3.8
+    STAGE2_MAX_EMA21_EXT_PCT = 10.0
+    STAGE2_RSI14_MAX = 74.0
+    STAGE2_MIN_HOLD_DAYS = 5
+    STAGE2_PROFIT_HARVEST_PCT = 15.0
+    RS_TOP_N = 10
+    RS_KEEP_N = 20
+    MAX_OPEN_POSITIONS = 5
 
     @classmethod
     def _sync_from_config(cls):
@@ -77,8 +91,55 @@ class MapleStrategy:
             cls.BREAKEVEN_TRIGGER_PCT = float(cfg.get("breakeven_trigger_pct", cls.BREAKEVEN_TRIGGER_PCT))
             cls.COMMISSION_PER_ORDER_CAD = float(cfg.get("commission_per_order_cad", cls.COMMISSION_PER_ORDER_CAD))
             cls.MIN_NET_PROFIT_PCT = float(cfg.get("min_net_profit_pct", cls.MIN_NET_PROFIT_PCT))
+            cls.RS_TOP_N = int(cfg.get("rs_top_n", cls.RS_TOP_N))
+            cls.RS_KEEP_N = int(cfg.get("rs_keep_n", cls.RS_KEEP_N))
+            cls.MAX_OPEN_POSITIONS = max(1, int(cfg.get("max_open_positions", cls.MAX_OPEN_POSITIONS)))
+            cls.STAGE2_MIN_HOLD_DAYS = int(cfg.get("min_hold_days_for_trend_exit", cls.STAGE2_MIN_HOLD_DAYS))
         except Exception:
             pass
+
+    @classmethod
+    def evaluate_stage2_entry(cls, stock_data: Dict[str, Any]) -> Tuple[float, str]:
+        """Variant D: Evaluates Stage-2 Uptrend entry for Top-RS leaders (5 equal 20% slots, uncapped trend)."""
+        cls._sync_from_config()
+        td_to_earnings = stock_data.get("trading_days_to_earnings")
+        days_to_earnings = td_to_earnings if isinstance(td_to_earnings, (int, float)) else stock_data.get("days_to_earnings")
+        if isinstance(days_to_earnings, (int, float)) and 0 <= days_to_earnings <= 3:
+            ed_str = stock_data.get("earnings_date", "Soon")
+            return 0.0, f"BLOCKED by Earnings Risk: Earnings call in {int(days_to_earnings)} trading days ({ed_str})"
+
+        price = stock_data.get("Price")
+        open_px = stock_data.get("Open")
+        ema_21 = stock_data.get("EMA_21")
+        sma_50 = stock_data.get("SMA_50")
+        sma_200 = stock_data.get("SMA_200")
+        sma_50_rising = stock_data.get("SMA_50_Rising", True)
+        rsi_14 = stock_data.get("RSI_14")
+        rs_score = stock_data.get("RS_Score")
+
+        if not isinstance(price, (int, float)) or price <= 0:
+            return 0.0, "BLOCKED: Invalid price"
+        if isinstance(rs_score, (int, float)) and rs_score <= 0.0:
+            return 0.0, f"BLOCKED by Relative Strength Floor: RS_Score ({rs_score:+.2f}%) <= 0.0%"
+        if not (isinstance(sma_50, (int, float)) and sma_50 > 0 and isinstance(sma_200, (int, float)) and sma_200 > 0):
+            return 0.0, "BLOCKED by Stage-2 Filter: Missing SMA_50 / SMA_200"
+        if not (price > sma_50 and sma_50 > sma_200):
+            return 0.0, f"BLOCKED by Stage-2 Filter: Requires Price (${price:.2f}) > SMA_50 (${sma_50:.2f}) > SMA_200 (${sma_200:.2f})"
+        if not sma_50_rising:
+            return 0.0, f"BLOCKED by Stage-2 Slope Filter: SMA_50 (${sma_50:.2f}) is falling"
+        if not (isinstance(ema_21, (int, float)) and ema_21 > 0 and price > ema_21):
+            return 0.0, f"BLOCKED by Trend Support Filter: Price (${price:.2f}) <= EMA_21 (${ema_21})"
+        ext_pct = ((price - ema_21) / ema_21) * 100.0
+        if ext_pct > cls.STAGE2_MAX_EMA21_EXT_PCT:
+            return 0.0, f"BLOCKED by EMA_21 Extension Cap: +{ext_pct:.2f}% > {cls.STAGE2_MAX_EMA21_EXT_PCT:.1f}% max"
+        if isinstance(open_px, (int, float)) and open_px > 0 and price < open_px:
+            return 0.0, f"BLOCKED by Red-Candle Guard: Price (${price:.2f}) < Open (${open_px:.2f})"
+        if isinstance(rsi_14, (int, float)) and rsi_14 > cls.STAGE2_RSI14_MAX:
+            return 0.0, f"BLOCKED by RSI_14 Climax Ceiling: RSI_14 ({rsi_14}) > {cls.STAGE2_RSI14_MAX}"
+
+        slot_pct = round(1.0 / cls.MAX_OPEN_POSITIONS, 4)
+        rs_lbl = f"RS {rs_score:+.1f}%" if isinstance(rs_score, (int, float)) else "Stage-2"
+        return slot_pct, f"Stage-2 Top-RS Leader ({rs_lbl}, +{ext_pct:.1f}% above EMA21, RSI14 {rsi_14})"
 
     @classmethod
     def calculate_tranche_size(
@@ -116,6 +177,9 @@ class MapleStrategy:
         )
 
         if is_capitulation:
+            sma_200 = stock_data.get("SMA_200")
+            if isinstance(price, (int, float)) and isinstance(sma_200, (int, float)) and sma_200 > 0 and price < sma_200:
+                return 0.0, f"BLOCKED by Capitulation Secular Downtrend Guard: Price (${price:.2f}) < SMA_200 (${sma_200:.2f})"
             if not (isinstance(rsi, (int, float)) and rsi < cls.RSI_OVERSOLD_MAX):
                 return 0.0, f"BLOCKED by Capitulation Filter: RSI_7 ({rsi}) must be < {cls.RSI_OVERSOLD_MAX}"
             if not (isinstance(vol_ratio, (int, float)) and vol_ratio >= cls.VOLUME_CAPITULATION_RATIO):
@@ -254,14 +318,25 @@ class MapleStrategy:
         shares: float = 1.0,
         cost_basis: Optional[float] = None,
         signal_type: str = "REGULAR",
-    ) -> Tuple[float, float]:
-        """Calculates Target Sell Price and Stop Loss Price.
-        Explicitly factors in two-way trade commissions (entry + exit) to guarantee
-        that the target yields a meaningful NET return on invested capital.
-        """
+    ) -> Tuple[Optional[float], float]:
+        """Calculates Target Sell Price (or None when uncapped in STAGE2_RS) and Stop Loss Price."""
         cls._sync_from_config()
         base_price = float(cost_basis) if (cost_basis and cost_basis > 0) else float(current_price)
         eff_shares = max(1.0, float(shares or 1.0))
+
+        atr_14 = stock_data.get("ATR_14")
+        atr = stock_data.get("ATR_5")
+        has_atr14 = isinstance(atr_14, (int, float)) and atr_14 > 0
+        days_to_ex_div = stock_data.get("days_to_ex_dividend")
+
+        if str(signal_type).upper() == "STAGE2_RS":
+            atr_ref = float(atr_14) if has_atr14 else (float(atr) if isinstance(atr, (int, float)) and atr > 0 else base_price * 0.025)
+            raw_stop_pct = ((atr_ref * cls.STAGE2_HARD_STOP_ATR_MULT) / base_price) * 100.0 if base_price > 0 else 7.0
+            eff_stop_pct = max(3.5, min(10.0, raw_stop_pct))
+            stop_loss = round(base_price * (1.0 - eff_stop_pct / 100.0), 2)
+            if isinstance(days_to_ex_div, (int, float)) and 0 <= days_to_ex_div <= 3:
+                stop_loss = round(stop_loss * 0.99, 2)
+            return None, stop_loss
 
         # Two-way round-trip commission drag per share ($1.00 buy + $1.00 sell = $2.00 min on IBKR)
         roundtrip_comm_per_share = (2.0 * cls.COMMISSION_PER_ORDER_CAD) / eff_shares
@@ -270,7 +345,6 @@ class MapleStrategy:
         min_net_hurdle = base_price + roundtrip_comm_per_share + (base_price * (cls.MIN_NET_PROFIT_PCT / 100.0))
         min_target = round(min_net_hurdle, 2)
 
-        atr = stock_data.get("ATR_5")
         bb_mid = stock_data.get("BB_Mid")
         rsi = stock_data.get("RSI_7")
         is_capitulation = ("CAPITULATION" in str(signal_type).upper()) or (
@@ -278,20 +352,25 @@ class MapleStrategy:
         )
 
         eff_stop_pct = cls.STOP_LOSS_PCT
-        if isinstance(atr, (int, float)) and atr > 0 and base_price > 0:
+        if has_atr14 and base_price > 0:
+            atr_stop_pct = ((float(atr_14) * cls.ATR_STOP_MULTIPLIER) / base_price) * 100.0
+            eff_stop_pct = max(cls.MIN_ATR14_STOP_PCT, min(cls.MAX_ATR14_STOP_PCT, atr_stop_pct))
+        elif isinstance(atr, (int, float)) and atr > 0 and base_price > 0:
             atr_stop_pct = ((float(atr) * cls.ATR_STOP_MULTIPLIER) / base_price) * 100.0
             eff_stop_pct = max(cls.MIN_STOP_LOSS_PCT, min(cls.STOP_LOSS_PCT, atr_stop_pct))
         stop_loss = round(base_price * (1.0 - eff_stop_pct / 100.0), 2)
 
         # 2. Ex-Dividend Adjustment: Account for mechanical price drop if ex-date is within 3 days
-        days_to_ex_div = stock_data.get("days_to_ex_dividend")
         if isinstance(days_to_ex_div, (int, float)) and 0 <= days_to_ex_div <= 3:
             stop_loss = round(stop_loss * 0.99, 2)
 
         target = None
         if is_capitulation:
-            # Mean-reversion capitulation bounces harvest at +3.5% (capped below extended BB_Mid/ATR breakout targets)
+            # Mean-reversion capitulation bounces harvest at +3.5%
             target = round(base_price * (1.0 + cls.CAPITULATION_TARGET_PCT / 100.0), 2)
+        elif has_atr14:
+            # Let trend entries run to 2.5x completed daily ATR_14 without capping at overhead BB_Mid resistance
+            target = round(base_price + (float(atr_14) * cls.ATR14_TARGET_MULTIPLIER), 2)
         elif isinstance(bb_mid, (int, float)) and bb_mid >= min_target:
             target = round(float(bb_mid), 2)
         elif isinstance(atr, (int, float)) and atr > 0:

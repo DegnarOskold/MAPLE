@@ -69,7 +69,8 @@ def run_checks():
         assert res_sec is None, "Sector cap failed to block Precious Metals breach"
 
     # 3. Scale-in 4h cooldown & red-candle guard on Entry #2
-    now = datetime.datetime.now()
+    from maple_market import now_et_naive
+    now = now_et_naive()
     with patch.object(maple_ledger, "load_config", return_value=dict(base_cfg)), \
          patch.object(maple_ledger, "get_position_buy_counts", return_value={"RUS.TO": 1}), \
          patch.object(maple_ledger, "get_position_last_buy_info", return_value={"RUS.TO": {"last_buy_dt": now - datetime.timedelta(minutes=15), "last_buy_price": 90.0, "shares": 1.0}}):
@@ -380,7 +381,7 @@ def run_checks():
         assert len(movers) == 1 and movers[0]["eligible"] is False and "Trend Gatekeeper" in movers[0]["gate_status"], f"Gated top mover hidden: {movers}"
 
     # 16. Oct 29 Retrospective Patches: scale-in #2 price-progress guard, post-scale target math, 3-bucket BUY audit & untruncated gate strings
-    old_buy_dt = datetime.datetime.now() - datetime.timedelta(hours=5.0)
+    old_buy_dt = now - datetime.timedelta(hours=5.0)
     with patch.object(maple_ledger, "load_config", return_value={"trading_mode": "SIMULATED", "scale_in_cooldown_hours": 4.0, "pending_orders": {}}), \
          patch.object(maple_ledger, "save_config"), \
          patch.object(maple_ledger, "get_position_buy_counts", return_value={"CCL-B.TO": 1}), \
@@ -838,10 +839,12 @@ def run_checks():
     )
     assert rus_cap_tgt == 79.60 and rus_cap_stp == 73.06, f"Capitulation target not capped at +3.5%: tgt={rus_cap_tgt}, stp={rus_cap_stp}"
 
-    # 27. US Equities Migration: 47 Zoya-certified US tickers, US normalization, and US commodity macro alignment
+    # 27. US Equities Migration: 53 Zoya-certified US tickers (incl. AVGO, LLY, AMD, PANW, SNPS, CDNS; excluding COST)
     _legacy_tsx_patch.stop()
     _legacy_brain_patch.stop()
-    assert len(maple_ledger.SHARIAH_COMPLIANT_BASKET) == 47, f"Expected 47 US tickers, got {len(maple_ledger.SHARIAH_COMPLIANT_BASKET)}"
+    assert len(maple_ledger.SHARIAH_COMPLIANT_BASKET) == 53, f"Expected 53 US tickers, got {len(maple_ledger.SHARIAH_COMPLIANT_BASKET)}"
+    assert {"AVGO", "LLY", "AMD", "PANW", "SNPS", "CDNS"}.issubset(maple_ledger.SHARIAH_COMPLIANT_BASKET)
+    assert "COST" not in maple_ledger.SHARIAH_COMPLIANT_BASKET, "COST (Zoya questionable) must remain excluded"
     assert maple_ledger.normalize_ticker("NVDA") == "NVDA" and maple_ledger.normalize_ticker("BRK.B") == "BRK-B"
     assert maple_ledger.normalize_ticker("PAAS.TO") == "PAAS.TO"
     assert maple_market.is_macro_aligned("NEM", {"GC=F": False, "CL=F": True, "VIX_PANIC": True})[0] is False
@@ -908,7 +911,181 @@ def run_checks():
     import maple_backtest
     assert callable(maple_backtest.run_backtest) and maple_backtest.run_backtest({})["trades"] == 0
 
-    print("ALL 28 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 30. Nov 25 Execution & Safety Hardening (Items 1-8):
+    # (1) Profit-locked stop preserved on scale-in when blended gain >= +2.5%
+    pg_scale_cfg = {"active_targets": {"PG": {"target_price": 112.0, "stop_loss_price": 104.68}}}
+    assert maple_ledger._resolve_buy_stop(pg_scale_cfg, "PG", 96.90, 106.00, 4.0, blended_acb=102.00) == 104.68
+
+    # (2) Partial-fill terminal cleanup in sync_working_orders + SWEEP_ETF excluded from active_targets
+    pf_broker = MagicMock()
+    pf_broker.is_authenticated.return_value = True
+    pf_broker.get_order_status.side_effect = [
+        {"order_status": "Inactive", "cum_fill": 4, "average_price": 98.50},
+        {"order_status": "Filled", "cum_fill": 20, "average_price": 54.10},
+    ]
+    pf_broker.get_balances.return_value = {}  # Also verifies empty get_balances fallback
+    pf_broker.get_positions.return_value = [{"symbol": "KO", "openQuantity": 4}, {"symbol": "SPUS", "openQuantity": 20}]
+    pf_cfg = {
+        "trading_mode": "LIVE",
+        "account_id": "U12345678",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {
+            "KO": {"order_id": "301", "action": "BUY", "shares": 10, "existing_shares": 0, "acb": 0.0, "limit_price": 98.50, "cash_before": 1000.0, "target_price": 102.0, "stop_loss_price": 95.30, "stock_data": {"ATR_5": 1.1, "BB_Mid": 100.0}, "signal_type": "REGULAR BUY"},
+            "SPUS": {"order_id": "302", "action": "BUY", "shares": 20, "existing_shares": 0, "acb": 0.0, "limit_price": 54.10, "cash_before": 2000.0},
+        },
+        "active_targets": {},
+    }
+    pf_logs = []
+    with patch.object(maple_ledger, "load_config", return_value=pf_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_broker_client", return_value=pf_broker), \
+         patch.object(maple_ledger, "log_trade", side_effect=lambda *a, **kw: pf_logs.append(a)), \
+         patch.object(telegram_notifier, "send_trade_alert", return_value=True):
+        rem_pend = maple_ledger.sync_working_orders()
+    assert rem_pend == {} and "KO" in pf_cfg["active_targets"] and "SPUS" not in pf_cfg["active_targets"], f"Partial-fill sync bug: {pf_cfg}"
+    assert pf_logs[0][2] == 4 and pf_logs[0][5] == 605.0, f"Partial fill qty or empty-balance cash fallback wrong: {pf_logs[0]}"
+
+    # (3) LIVE fail-closed abort + circuit breaker alert (never send fake scan update on CSV fallback)
+    breaker_alerts, fake_scans = [], []
+    with patch.object(maple_brain, "load_config", return_value={"trading_mode": "LIVE", "allowed_tickers": ["AAPL"]}), \
+         patch.object(maple_brain, "is_opening_chop", return_value=False), \
+         patch.object(maple_brain, "is_market_open", return_value=True), \
+         patch.object(maple_brain, "get_ledger_state", return_value={"mode": "SIMULATED", "live_verified": False, "live_fallback": True, "live_error": "401 unauthenticated", "cash": 900.0, "positions": {}}), \
+         patch.object(telegram_notifier, "send_circuit_breaker_alert", side_effect=lambda *a, **kw: breaker_alerts.append(a) or True), \
+         patch.object(telegram_notifier, "send_scan_update", side_effect=lambda *a, **kw: fake_scans.append(a) or True):
+        halt_res = maple_brain.run_intraday_scan()
+    assert halt_res["status"] == "BROKER_UNAVAILABLE" and len(breaker_alerts) == 1 and fake_scans == [], f"LIVE fail-closed failed: {halt_res}"
+
+    # (5) IBKR replyId guard blocks margin/GFV prompts while allowing benign price-cap prompts
+    ib_guard = ibkr_client.IBKRClient.__new__(ibkr_client.IBKRClient)
+    ib_guard.base_url = "https://localhost:5000/v1/api"
+    ib_guard.session = MagicMock()
+    ib_guard.session.post.side_effect = [
+        MagicMock(json=lambda: [{"id": "r_gfv", "message": ["Cash account Good Faith Violation warning"]}]),
+        MagicMock(json=lambda: {"confirmed": False}),
+    ]
+    gfv_res = ib_guard.place_limit_order("U123", 265598, "Buy", 1, 200.0)
+    assert gfv_res["orderId"] is None and "Good Faith" in gfv_res.get("rejected_reason", ""), f"Unsafe GFV prompt not blocked: {gfv_res}"
+
+    ib_guard.session.post.side_effect = [
+        MagicMock(json=lambda: [{"id": "r_cap", "message": ["Order price exceeds Percentage constraint of 3%"]}]),
+        MagicMock(json=lambda: [{"order_id": "987654"}]),
+    ]
+    ok_res = ib_guard.place_limit_order("U123", 265598, "Buy", 1, 200.0)
+    assert ok_res["orderId"] == "987654", f"Benign price-cap prompt failed to confirm: {ok_res}"
+
+    # (6) NYSE holiday (Thanksgiving 2026-11-26) & 1:00 PM early close (Black Friday 2026-11-27, Dec 24)
+    assert maple_market.is_nyse_holiday(datetime.date(2026, 11, 26)) is True
+    assert maple_market.is_nyse_trading_day(datetime.date(2026, 11, 26)) is False
+    assert maple_ledger._count_trading_days(datetime.datetime(2026, 11, 25, 10, 0), datetime.datetime(2026, 11, 27, 10, 0)) == 1
+    assert maple_market.is_nyse_early_close(datetime.date(2026, 11, 27)) is True
+    assert maple_market.get_nyse_close_hour_min(datetime.date(2026, 11, 27)) == (13, 0)
+    assert maple_market.get_nyse_close_hour_min(datetime.date(2026, 12, 24)) == (13, 0)
+
+    # (7) Held position removed from allowed_tickers still fetched for stop/target protection
+    fetched_lists = []
+    orphan_state = {"mode": "SIMULATED", "cash": 5000.0, "total_equity": 6000.0, "positions": {"NKE": {"shares": 10.0, "acb": 36.0}}}
+    with patch.object(maple_brain, "is_opening_chop", return_value=False), \
+         patch.object(maple_brain, "is_market_open", return_value=True), \
+         patch.object(maple_brain, "load_config", return_value={"trading_mode": "SIMULATED", "allowed_tickers": ["AAPL"], "idle_cash_sweep": False}), \
+         patch.object(maple_brain, "get_ledger_state", return_value=orphan_state), \
+         patch.object(maple_brain, "fetch_latest_market_prices", side_effect=lambda tks: (fetched_lists.append(list(tks)), {"AAPL": {"Price": 350.0}, "NKE": {"Price": 34.0}})[1]), \
+         patch.object(maple_brain, "check_target_stops"), \
+         patch.object(maple_brain, "get_macro_alignment", return_value={"GC=F": True, "CL=F": True, "VIX_PANIC": False}), \
+         patch.object(importlib, "reload", side_effect=lambda m: m), \
+         patch.object(telegram_notifier, "send_scan_update", return_value=True):
+        maple_brain.run_intraday_scan()
+    assert fetched_lists and set(fetched_lists[0]) == {"AAPL", "NKE"}, f"Removed held ticker NKE omitted from quote fetch: {fetched_lists}"
+
+    # (8) Post-fill target_price & ATR stop recomputed from actual filled share count and price
+    recomp_cfg = {"trading_mode": "SIMULATED", "commission_per_order_cad": 1.0, "min_net_profit_pct": 2.5, "max_single_share_nav_pct": 0.30, "pending_orders": {}, "active_targets": {}}
+    with patch.object(maple_ledger, "load_config", return_value=recomp_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_ledger_state", return_value={"cash": 1000.0, "total_equity": 1000.0, "positions": {}}), \
+         patch.object(maple_ledger, "get_position_buy_counts", return_value={}), \
+         patch.object(maple_ledger, "log_trade"):
+        # Pre-fill passed target_price=102.90 (assuming 5 shs -> $0.40/sh comm), but allocated $100 buys 1 share -> must recompute to $104.50 ($100 + $2 comm + $2.50)
+        maple_ledger.execute_buy("KO", 100.0, 100.0, target_price=102.90, stock_data={"ATR_5": 1.0, "BB_Mid": 99.0}, signal_type="REGULAR BUY")
+    assert recomp_cfg["active_targets"]["KO"] == {"target_price": 104.50, "stop_loss_price": 96.75}, f"Post-fill target/ATR-stop recompute failed: {recomp_cfg}"
+
+    # 31. Strategy Expectancy Upgrades: SMA_200 Capitulation guard, ATR_14 [3.0%, 7.5%] + 2.5x uncapped trend target, Ret_63d ranking & R-multiple ratchets
+    nke_cap_block, nke_cap_r = MapleStrategy.calculate_tranche_size(
+        {"Price": 36.0, "Open": 35.2, "Pct_From_Low": 2.4, "RSI_7": 28.0, "Vol_Ratio": 1.6, "SMA_200": 48.0, "EMA_Crossover": "BEARISH (EMA5 < EMA9)"},
+        signal_type="CAPITULATION REVERSAL",
+    )
+    assert nke_cap_block == 0.0 and "SMA_200" in nke_cap_r, f"Below-SMA200 capitulation knife-catch not blocked: {nke_cap_block}, {nke_cap_r}"
+
+    # High-beta stock ($100, ATR_14=$4.00 -> 2.2*ATR=8.8% clamped to 7.5% -> stop $92.50; trend target ignores BB_Mid=$103.50 and sets $100 + 2.5*$4 = $110.00)
+    hb_tgt, hb_stp = MapleStrategy.calculate_targets(
+        100.0, {"ATR_14": 4.00, "ATR_5": 3.80, "BB_Mid": 103.50, "RSI_7": 55.0}, shares=10.0, cost_basis=100.0, signal_type="REGULAR BUY"
+    )
+    assert hb_tgt == 110.00 and hb_stp == 92.50, f"ATR_14 uncapped target / 7.5% stop clamp mismatch: tgt={hb_tgt}, stp={hb_stp}"
+
+    # R-multiple ratchet: 1R = $7.50 ($100 ACB, $92.50 init_stop). At +3.5% ($103.50 = +0.47R), MUST NOT prematurely breakeven-ratchet; at +1.1R ($108.25), ratchets to comm breakeven ($100.10)
+    r_cfg = {
+        "trading_mode": "LIVE",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "active_targets": {"NVDA": {"target_price": 118.75, "stop_loss_price": 92.50, "initial_stop_price": 92.50}},
+        "initial_portfolio": {},
+    }
+    r_state = {"mode": "LIVE", "live_verified": True, "cash": 5000.0, "total_equity": 6035.0, "positions": {"NVDA": {"shares": 10.0, "acb": 100.0, "current_price": 103.50}}}
+    with patch.object(maple_ledger, "sync_working_orders", return_value={}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=r_state), \
+         patch.object(maple_ledger, "load_config", return_value=r_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_position_holding_days", return_value={"NVDA": 1}), \
+         patch.object(maple_ledger, "execute_sell"):
+        maple_ledger.check_target_stops({"NVDA": 103.50}, market_data={"NVDA": {"ATR_14": 4.0}})
+        assert r_cfg["active_targets"]["NVDA"]["stop_loss_price"] == 92.50, f"+0.47R noise move should not choke high-beta trade: {r_cfg}"
+        maple_ledger.check_target_stops({"NVDA": 108.25}, market_data={"NVDA": {"ATR_14": 4.0}})
+        assert r_cfg["active_targets"]["NVDA"]["stop_loss_price"] == 100.10, f"+1.10R move should ratchet to comm breakeven ($100.10): {r_cfg}"
+
+    # Ret_63d leader ranking prioritizes sustained 3-month RS leader over single-day volume spike in laggard
+    rs_mkt = {
+        "CSCO": {"Price": 60.0, "Open": 59.0, "EMA_5": 59.5, "EMA_9": 58.8, "SMA_50": 56.0, "Ret_63d": 4.0, "Ret_20d": 2.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.55, "ADX_14": 30.0, "RSI_7": 55.0},
+        "ANET": {"Price": 110.0, "Open": 108.0, "EMA_5": 109.0, "EMA_9": 107.5, "SMA_50": 98.0, "Ret_63d": 24.5, "Ret_20d": 9.0, "EMA_Crossover": "BULLISH (EMA5 > EMA9)", "Vol_Ratio": 1.35, "ADX_14": 30.0, "RSI_7": 55.0},
+    }
+    rs_sigs = maple_brain.evaluate_autonomous_signals(rs_mkt, {"CSCO", "ANET"}, macro_state={"GC=F": True, "CL=F": True})
+    assert [s["ticker"] for s in rs_sigs] == ["ANET", "CSCO"], f"Ret_63d RS ranking failed: {rs_sigs}"
+
+    # 32. Variant D (STAGE2_RS) Multi-Week Swing: Top-RS Stage-2 entry, uncapped target, intraday dip immunity & EOD SMA_50/EMA_21 exits
+    s2_mkt = {
+        "AVGO": {"Price": 205.0, "Open": 202.0, "EMA_21": 198.0, "SMA_50": 185.0, "SMA_50_Rising": True, "SMA_200": 155.0, "RSI_14": 62.0, "ATR_14": 5.0, "RS_Score": 28.4},
+        "LLY": {"Price": 840.0, "Open": 832.0, "EMA_21": 815.0, "SMA_50": 780.0, "SMA_50_Rising": True, "SMA_200": 700.0, "RSI_14": 59.0, "ATR_14": 18.0, "RS_Score": 22.1},
+        "NKE": {"Price": 70.0, "Open": 69.0, "EMA_21": 68.0, "SMA_50": 72.0, "SMA_50_Rising": False, "SMA_200": 82.0, "RSI_14": 48.0, "ATR_14": 2.0, "RS_Score": -12.0},
+    }
+    s2_sigs = maple_brain.evaluate_autonomous_signals(
+        s2_mkt, {"AVGO", "LLY", "NKE"}, macro_state={"GC=F": True, "CL=F": True}, strategy_mode="STAGE2_RS"
+    )
+    assert [s["ticker"] for s in s2_sigs] == ["AVGO", "LLY"] and all(s["tranche_pct"] == 0.20 for s in s2_sigs), f"Variant D Stage-2 signals mismatch: {s2_sigs}"
+    s2_tgt, s2_stp = MapleStrategy.calculate_targets(205.0, s2_mkt["AVGO"], shares=10.0, cost_basis=205.0, signal_type="STAGE2_RS")
+    assert s2_tgt is None and s2_stp == 191.0, f"Variant D should have uncapped target (None) & 2.8x ATR hard stop ($191.00), got {s2_tgt}, {s2_stp}"
+
+    s2_sells = []
+    s2_cfg = {
+        "trading_mode": "LIVE",
+        "strategy_mode": "STAGE2_RS",
+        "commission_per_order_cad": 1.0,
+        "pending_orders": {},
+        "active_targets": {"AVGO": {"strategy_mode": "STAGE2_RS", "target_price": None, "stop_loss_price": 191.0, "peak_price": 240.0, "initial_stop_price": 191.0}},
+        "initial_portfolio": {},
+    }
+    s2_state = {"mode": "LIVE", "live_verified": True, "cash": 4000.0, "total_equity": 8700.0, "positions": {"AVGO": {"shares": 20.0, "acb": 200.0, "current_price": 235.0}}}
+    with patch.object(maple_ledger, "sync_working_orders", return_value={}), \
+         patch.object(maple_ledger, "get_ledger_state", return_value=s2_state), \
+         patch.object(maple_ledger, "load_config", return_value=s2_cfg), \
+         patch.object(maple_ledger, "save_config"), \
+         patch.object(maple_ledger, "get_position_holding_days", return_value={"AVGO": 12}), \
+         patch.object(maple_ledger, "execute_sell", side_effect=lambda t, p, reason="": s2_sells.append((t, p, reason))):
+        # Mid-day dip below EMA_21 ($238) while above catastrophic stop ($221) MUST NOT exit intraday (is_eod_window=False)
+        maple_ledger.check_target_stops({"AVGO": 235.0}, market_data={"AVGO": {"EMA_21": 238.0, "SMA_50": 215.0, "ATR_14": 5.0}}, is_eod_window=False, top_keep_tickers={"AVGO"})
+        assert s2_sells == [], f"Variant D exited prematurely on mid-day EMA_21 dip: {s2_sells}"
+        # Near close (is_eod_window=True) at +17.5% (>= +15% profit harvest) with Close < EMA_21 -> harvests winner cleanly!
+        maple_ledger.check_target_stops({"AVGO": 235.0}, market_data={"AVGO": {"EMA_21": 238.0, "SMA_50": 215.0, "ATR_14": 5.0}}, is_eod_window=True, top_keep_tickers={"AVGO"})
+        assert len(s2_sells) == 1 and "AUTO STAGE-2 EMA_21 EXIT" in s2_sells[0][2], f"Variant D EOD profit harvest failed: {s2_sells}"
+
+    print("ALL 32 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

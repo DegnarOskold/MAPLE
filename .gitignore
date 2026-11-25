@@ -12,6 +12,7 @@ maple_config.json
 # Live & Historical Financial Records (Trades, NAV, Advice Logs)
 maple_trades.csv
 maple_daily_nav.json
+maple_daily_nav*.json
 maple_advice_history.txt
 maple_trades_*.csv
 maple_logic_changelog.md

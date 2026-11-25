@@ -11,16 +11,12 @@ import csv
 import json
 import datetime
 from typing import Dict, Any, Optional
+
+from maple_market import now_et_naive, count_nyse_trading_days
 def get_broker_client():
-    """Factory to instantiate the active broker client (IBKR or Questrade)."""
-    cfg = load_config()
-    broker = cfg.get("broker", "IBKR").upper()
-    if broker == "IBKR":
-        from ibkr_client import IBKRClient
-        return IBKRClient()
-    else:
-        from questrade_client import QuestradeClient
-        return QuestradeClient()
+    """Factory to instantiate the active Interactive Brokers client."""
+    from ibkr_client import IBKRClient
+    return IBKRClient()
 
 MAPLE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADES_FILE = os.path.join(MAPLE_DIR, "maple_trades.csv")
@@ -28,13 +24,13 @@ CONFIG_FILE = os.path.join(MAPLE_DIR, "maple_config.json")
 ADVICE_FILE = os.path.join(MAPLE_DIR, "maple_advice_history.txt")
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
 
-# Strict Gatekeeper Universe: No order may be submitted outside this basket (47 Zoya-certified US tickers)
+# Strict Gatekeeper Universe: No order may be submitted outside this basket (53 Zoya-certified US tickers; COST excluded)
 SHARIAH_COMPLIANT_BASKET = {
-    # Technology & Semiconductors (14)
-    "AAPL", "NVDA", "ANET", "QCOM", "TXN", "AMAT", "LRCX", "MRVL", "ON",
-    "CRWD", "FTNT", "CRM", "ADBE", "CSCO",
-    # Healthcare & MedTech (8)
-    "JNJ", "ABBV", "MRK", "GILD", "ISRG", "BSX", "EW", "DHR",
+    # Technology & Semiconductors (19)
+    "AAPL", "NVDA", "AVGO", "AMD", "ANET", "QCOM", "TXN", "AMAT", "LRCX", "MRVL", "ON",
+    "CRWD", "PANW", "FTNT", "SNPS", "CDNS", "CRM", "ADBE", "CSCO",
+    # Healthcare & MedTech (9)
+    "LLY", "JNJ", "ABBV", "MRK", "GILD", "ISRG", "BSX", "EW", "DHR",
     # Energy (5)
     "XOM", "CVX", "COP", "EOG", "SLB",
     # Industrials & Logistics (7)
@@ -46,14 +42,15 @@ SHARIAH_COMPLIANT_BASKET = {
 }
 
 SECTOR_MAP = {
-    # Technology & Semiconductors (14)
-    "AAPL": "Technology", "NVDA": "Technology", "ANET": "Technology", "QCOM": "Technology",
-    "TXN": "Technology", "AMAT": "Technology", "LRCX": "Technology", "MRVL": "Technology",
-    "ON": "Technology", "CRWD": "Technology", "FTNT": "Technology", "CRM": "Technology",
-    "ADBE": "Technology", "CSCO": "Technology",
-    # Healthcare & MedTech (8)
-    "JNJ": "Healthcare", "ABBV": "Healthcare", "MRK": "Healthcare", "GILD": "Healthcare",
-    "ISRG": "Healthcare", "BSX": "Healthcare", "EW": "Healthcare", "DHR": "Healthcare",
+    # Technology & Semiconductors (19)
+    "AAPL": "Technology", "NVDA": "Technology", "AVGO": "Technology", "AMD": "Technology",
+    "ANET": "Technology", "QCOM": "Technology", "TXN": "Technology", "AMAT": "Technology",
+    "LRCX": "Technology", "MRVL": "Technology", "ON": "Technology", "CRWD": "Technology",
+    "PANW": "Technology", "FTNT": "Technology", "SNPS": "Technology", "CDNS": "Technology",
+    "CRM": "Technology", "ADBE": "Technology", "CSCO": "Technology",
+    # Healthcare & MedTech (9)
+    "LLY": "Healthcare", "JNJ": "Healthcare", "ABBV": "Healthcare", "MRK": "Healthcare",
+    "GILD": "Healthcare", "ISRG": "Healthcare", "BSX": "Healthcare", "EW": "Healthcare", "DHR": "Healthcare",
     # Energy (5)
     "XOM": "Energy", "CVX": "Energy", "COP": "Energy", "EOG": "Energy", "SLB": "Energy",
     # Industrials & Logistics (7)
@@ -175,7 +172,7 @@ def compute_twr_pct(
                     hist = json.load(f)
             except Exception:
                 hist = {}
-    t_str = (today_str or datetime.datetime.now().strftime("%Y-%m-%d"))[:10]
+    t_str = (today_str or now_et_naive().strftime("%Y-%m-%d"))[:10]
     dates = [d for d in sorted(hist.keys()) if d < t_str]
     if not dates:
         inv = get_total_invested_capital(cfg, up_to_date=t_str)
@@ -227,10 +224,14 @@ def _resolve_buy_stop(
     existing_shares: float,
     blended_acb: Optional[float] = None,
 ) -> float:
-    """Preserves ratcheted stop_loss_price (< fill_price) when scaling in, capped at -2.5% half-risk below blended ACB."""
+    """Preserves ratcheted stop_loss_price (< fill_price) when scaling in without wiping out profit-locked stops."""
     if existing_shares > 0:
         eff_acb = blended_acb if (isinstance(blended_acb, (int, float)) and blended_acb > 0) else fill_price
-        max_scale_stop = round(eff_acb * 0.975, 2)
+        trail_cap = round(fill_price * 0.9875, 2)
+        post_scale_gain_pct = (((fill_price - eff_acb) / eff_acb) * 100.0) if eff_acb > 0 else 0.0
+        # When blended position remains >= +2.5% in profit, preserve ratcheted stop up to -1.25% below fill;
+        # when blending pulls gain below +2.5%, cap at half-risk (-2.5% below blended ACB) to prevent tight-stop shakeouts.
+        max_scale_stop = trail_cap if post_scale_gain_pct >= 2.5 else min(trail_cap, round(eff_acb * 0.975, 2))
         active_targets = config.get("active_targets", {})
         for alias in ticker_aliases(ticker):
             existing_stop = (active_targets.get(alias) or {}).get("stop_loss_price")
@@ -258,7 +259,7 @@ def reconcile_capital_flows(
         return 0.0
     if not os.path.exists(NAV_FILE):
         return 0.0
-    t_str = (today_str or datetime.datetime.now().strftime("%Y-%m-%d"))[:10]
+    t_str = (today_str or now_et_naive().strftime("%Y-%m-%d"))[:10]
     try:
         with open(NAV_FILE, "r", encoding="utf-8") as f:
             history = json.load(f)
@@ -288,9 +289,11 @@ def reconcile_capital_flows(
                             net_trade_cash -= (qty * px + comm_est)
                         elif act == "SELL":
                             net_trade_cash += (qty * px - comm_est)
-                        cb = row.get("Cash_Balance")
-                        if cb not in (None, ""):
-                            last_csv_cash_today = float(cb)
+                            cb = row.get("Cash_Balance")
+                            if cb not in (None, ""):
+                                cb_val = float(cb)
+                                if cb_val > 0.0:
+                                    last_csv_cash_today = cb_val
         except Exception:
             return 0.0
 
@@ -325,7 +328,7 @@ def reconcile_capital_flows(
 
 def _get_reference_nav(config: Dict[str, Any]) -> float:
     """Returns previous day's closing NAV adjusted for any settled capital contributions since that close."""
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    today_str = now_et_naive().strftime("%Y-%m-%d")
     if os.path.exists(NAV_FILE):
         try:
             with open(NAV_FILE, "r", encoding="utf-8") as f:
@@ -348,6 +351,8 @@ def get_ledger_state() -> Dict[str, Any]:
     """
     config = load_config()
     is_live = config.get("trading_mode", "").upper() == "LIVE"
+    live_fallback = False
+    live_error = ""
 
     if is_live:
         try:
@@ -356,7 +361,7 @@ def get_ledger_state() -> Dict[str, Any]:
                 raise ConnectionError("Broker gateway is not authenticated (please log in at https://localhost:5000)")
             account_id = config.get("account_id") or client.get_primary_account_id()
             balances = client.get_balances(account_id)
-            if float(balances.get("total_equity", 0.0)) <= 0.0 and float(balances.get("cash", 0.0)) <= 0.0:
+            if not balances or (float(balances.get("total_equity", 0.0)) <= 0.0 and float(balances.get("cash", 0.0)) <= 0.0):
                 raise ValueError("Broker returned 0 equity/cash or is re-authenticating.")
             positions_raw = client.get_positions(account_id)
             active_targets = config.get("active_targets", {})
@@ -401,15 +406,26 @@ def get_ledger_state() -> Dict[str, Any]:
                 "account_id": account_id
             }
         except Exception as e:
+            live_fallback = True
+            live_error = str(e)
             broker_name = config.get("broker", "IBKR")
             print(f"[MAPLE WARNING] Failed to query live {broker_name} state ({e}), falling back to local ledger.")
 
     # Simulated or fallback ledger reconstruction
     positions: Dict[str, Dict[str, Any]] = {}
     cash = 0.0
+    usd_only = str(config.get("account_currency", "")).upper() == "USD"
 
     if not os.path.exists(TRADES_FILE):
-        return {"positions": positions, "cash": 0.0, "total_equity": 0.0, "mode": "SIMULATED", "live_verified": False}
+        return {
+            "positions": positions,
+            "cash": 0.0,
+            "total_equity": 0.0,
+            "mode": "SIMULATED",
+            "live_verified": False,
+            "live_fallback": live_fallback,
+            "live_error": live_error,
+        }
 
     with open(TRADES_FILE, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -425,7 +441,7 @@ def get_ledger_state() -> Dict[str, Any]:
             except (ValueError, KeyError):
                 continue
 
-            if ticker.upper() == "CASH":
+            if ticker.upper() == "CASH" or (usd_only and ticker.endswith(".TO")):
                 continue
 
             if ticker not in positions:
@@ -473,7 +489,9 @@ def get_ledger_state() -> Dict[str, Any]:
         "cash": round(cash, 2),
         "total_equity": fallback_equity,
         "mode": "SIMULATED",
-        "live_verified": False
+        "live_verified": False,
+        "live_fallback": live_fallback,
+        "live_error": live_error,
     }
 
 
@@ -486,7 +504,7 @@ def log_trade(
     cash_balance: float,
     notes: str = "",
 ):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = now_et_naive().strftime("%Y-%m-%d %H:%M:%S")
     row = [
         timestamp,
         ticker,
@@ -584,19 +602,24 @@ def _preflight_buy(
         print(f"[MAPLE] Pending order already active for {ticker}. Skipping duplicate BUY.")
         return None
 
+    is_stage2_mode = str(config.get("strategy_mode", "")).upper() == "STAGE2_RS"
+    max_slots = max(1, int(config.get("max_open_positions", 5)))
+
     def _passes_scale_in_guards(active_tickers: Optional[set] = None, fallback_px: float = 0.0) -> bool:
         buy_counts = get_position_buy_counts(active_tickers=active_tickers) if active_tickers is not None else get_position_buy_counts()
         eff_count = buy_counts.get(ticker, 0)
         if active_tickers is not None and ticker in active_tickers and eff_count == 0:
             eff_count = 1
-        if eff_count >= 2:
-            print(f"[MAPLE SCALE CAP] {ticker} already has {eff_count} entries in active cycle (max 2 entries allowed). Order blocked.")
+        max_entries = 1 if is_stage2_mode else 2
+        if eff_count >= max_entries:
+            print(f"[MAPLE SCALE CAP] {ticker} already has {eff_count} entry in active cycle (max {max_entries} allowed). Order blocked.")
             return False
         cooldown_hrs = float(config.get("scale_in_cooldown_hours", 4.0))
+        now_dt = now_et_naive()
         if eff_count == 0:
             exit_info = get_last_loss_exit_info().get(ticker)
             if exit_info and exit_info.get("last_exit_dt"):
-                elapsed_exit_hrs = (datetime.datetime.now() - exit_info["last_exit_dt"]).total_seconds() / 3600.0
+                elapsed_exit_hrs = (now_dt - exit_info["last_exit_dt"]).total_seconds() / 3600.0
                 if 0.0 <= elapsed_exit_hrs < cooldown_hrs:
                     print(
                         f"[MAPLE RE-ENTRY COOLDOWN] {ticker} exited via stop/stagnation {elapsed_exit_hrs:.2f}h ago (< {cooldown_hrs:.1f}h cooldown). Blocking whipsaw re-entry."
@@ -606,7 +629,7 @@ def _preflight_buy(
             last_map = get_position_last_buy_info(active_tickers=active_tickers) if active_tickers is not None else get_position_last_buy_info()
             last_buy = last_map.get(ticker)
             if last_buy and last_buy.get("last_buy_dt"):
-                elapsed_hrs = (datetime.datetime.now() - last_buy["last_buy_dt"]).total_seconds() / 3600.0
+                elapsed_hrs = (now_dt - last_buy["last_buy_dt"]).total_seconds() / 3600.0
                 if elapsed_hrs < cooldown_hrs:
                     print(
                         f"[MAPLE SCALE COOLDOWN] {ticker} entered {elapsed_hrs:.2f}h ago (< {cooldown_hrs:.1f}h cooldown). Blocking rapid scale-in."
@@ -652,6 +675,9 @@ def _preflight_buy(
         account_id = config.get("account_id") or client.get_primary_account_id()
 
         balances = client.get_balances(account_id)
+        if not balances or (float(balances.get("total_equity", 0.0)) <= 0.0 and float(balances.get("cash", 0.0)) <= 0.0):
+            print(f"[MAPLE LIVE BLOCKED] Broker returned empty/zero balances for {ticker}; aborting buy.")
+            return None
         total_equity = float(balances.get("total_equity", 1000.0))
         cash_available = float(balances.get("cash", 0.0))
         if check_cash:
@@ -668,7 +694,13 @@ def _preflight_buy(
         daily_loss_limit = get_effective_daily_loss_limit(config, ref_nav)
         drawdown = ref_nav - total_equity
         if drawdown >= daily_loss_limit:
-            print(f"[MAPLE CIRCUIT BREAKER] Daily loss limit exceeded vs prev close (${ref_nav:.2f}): -${drawdown:.2f} >= ${daily_loss_limit:.2f}. All buying halted.")
+            msg = f"Daily loss limit exceeded vs prev close (${ref_nav:.2f}): -${drawdown:.2f} >= ${daily_loss_limit:.2f}. All buying halted."
+            print(f"[MAPLE CIRCUIT BREAKER] {msg}")
+            try:
+                from telegram_notifier import send_circuit_breaker_alert
+                send_circuit_breaker_alert("Daily Drawdown Limit Hit", msg, cooldown_minutes=120)
+            except Exception:
+                pass
             return None
 
         positions_raw = client.get_positions(account_id)
@@ -681,6 +713,11 @@ def _preflight_buy(
         existing_pos = next((p for p in positions_raw if normalize_ticker(p.get("symbol", "")) in aliases or p.get("symbol", "").upper() in aliases), None)
         existing_shares = float(existing_pos.get("openQuantity", 0.0)) if existing_pos else 0.0
         existing_acb = float(existing_pos.get("averageEntryPrice", current_price)) if existing_pos else 0.0
+        if is_stage2_mode and not is_sweep and existing_shares <= 0:
+            non_sweep_open = {t for t in live_held if t != SWEEP_ETF}
+            if len(non_sweep_open) >= max_slots:
+                print(f"[MAPLE SLOT CAP] Portfolio already holds {len(non_sweep_open)}/{max_slots} Stage-2 positions. Blocking {ticker}.")
+                return None
         if not is_sweep and not _passes_scale_in_guards(active_tickers=live_held, fallback_px=existing_acb):
             return None
         existing_val = existing_shares * current_price
@@ -707,7 +744,7 @@ def _preflight_buy(
                 and t_sym not in held_sector_tickers
                 and t_sym not in pending_norm
                 and t_info.get("last_buy_dt")
-                and (datetime.datetime.now() - t_info["last_buy_dt"]).total_seconds() < 600
+                and (now_et_naive() - t_info["last_buy_dt"]).total_seconds() < 600
             ):
                 held_sector_cad += float(t_info.get("shares", 0.0)) * float(t_info.get("last_buy_price", 0.0))
 
@@ -774,6 +811,11 @@ def _preflight_buy(
         allocated_cash = max_single_cap
     existing_pos = state["positions"].get(ticker, {})
     current_shares = existing_pos.get("shares", 0.0)
+    if is_stage2_mode and not is_sweep and current_shares <= 0:
+        sim_open = {normalize_ticker(t) for t, p in state["positions"].items() if p.get("shares", 0) > 0 and normalize_ticker(t) != SWEEP_ETF}
+        if len(sim_open) >= max_slots:
+            print(f"[MAPLE SLOT CAP] Portfolio already holds {len(sim_open)}/{max_slots} Stage-2 positions. Blocking {ticker}.")
+            return None
     existing_acb = existing_pos.get("acb", current_price)
     existing_val = current_shares * current_price
     if not is_sweep and existing_val + allocated_cash > total_equity * max_pos_pct:
@@ -845,6 +887,39 @@ def preflight_buy(
         return 0.0
 
 
+def _recompute_targets_from_fill(
+    fill_price: float,
+    blended_acb: float,
+    total_shares: float,
+    stop_pct: float,
+    existing_shares: float,
+    target_price: Optional[float],
+    stop_loss_price: Optional[float],
+    stock_data: Optional[Dict[str, Any]] = None,
+    signal_type: str = "REGULAR",
+) -> tuple[Optional[float], float]:
+    """Recomputes target and base stop from actual fill price and share count when stock_data is available."""
+    if stock_data and not is_sweep_ticker(stock_data.get("_ticker", "")):
+        from maple_strategy import MapleStrategy
+        tgt, stp = MapleStrategy.calculate_targets(
+            fill_price, stock_data, shares=total_shares, cost_basis=blended_acb, signal_type=signal_type
+        )
+        return tgt, stp
+    if existing_shares > 0:
+        base_stop = (
+            float(stop_loss_price)
+            if (isinstance(stop_loss_price, (int, float)) and 0 < stop_loss_price < fill_price)
+            else round(blended_acb * (1.0 - stop_pct / 100.0), 2)
+        )
+    else:
+        base_stop = float(stop_loss_price) if stop_loss_price else round(fill_price * (1.0 - stop_pct / 100.0), 2)
+    return target_price, base_stop
+
+
+def is_sweep_ticker(ticker: str) -> bool:
+    return normalize_ticker(ticker) == SWEEP_ETF
+
+
 def execute_buy(
     ticker: str,
     allocated_cash: float,
@@ -853,6 +928,8 @@ def execute_buy(
     stop_loss_price: Optional[float] = None,
     notes: str = "",
     open_price: Optional[float] = None,
+    stock_data: Optional[Dict[str, Any]] = None,
+    signal_type: str = "REGULAR",
 ) -> Optional[Dict[str, Any]]:
     """Executes a BUY order.
     In LIVE mode: validates Shariah whitelist, daily drawdown vs previous close, concentration & sector caps,
@@ -971,15 +1048,20 @@ def execute_buy(
                     break
 
             stop_pct = config.get("stop_loss_pct", 5.0)
+            default_comm = float(config.get("commission_per_order_cad", 1.0))
             if order_status == "Filled" or cum_fill >= shares:
                 actual_px = avg_fill_price if avg_fill_price > 0 else limit_price
                 new_shares = existing_shares + shares
                 blended_acb = ((existing_shares * existing_acb) + (shares * actual_px)) / new_shares if existing_shares > 0 else actual_px
-                base_stop = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if existing_shares > 0 else (stop_loss_price if stop_loss_price else round(actual_px * (1.0 - stop_pct / 100.0), 2))
+                eff_target, base_stop = _recompute_targets_from_fill(
+                    actual_px, blended_acb, new_shares, stop_pct, existing_shares,
+                    target_price, stop_loss_price, stock_data=stock_data if not is_sweep else None, signal_type=signal_type,
+                )
                 eff_stop = _resolve_buy_stop(config, ticker, base_stop, actual_px, existing_shares, blended_acb=blended_acb)
 
                 bal_after = client.get_balances(account_id)
-                rem_cash = bal_after.get("cash", cash_available - (shares * actual_px))
+                est_rem_cash = round(max(0.0, cash_available - (shares * actual_px) - default_comm), 2)
+                rem_cash = float(bal_after["cash"]) if (bal_after and "cash" in bal_after) else est_rem_cash
 
                 order_note = f"LIVE LIMIT ORDER #{order_id} | {notes}".strip()
                 log_trade(ticker, "BUY", shares, actual_px, new_shares, rem_cash, notes=order_note)
@@ -987,10 +1069,14 @@ def execute_buy(
                 if not is_sweep:
                     if "active_targets" not in config:
                         config["active_targets"] = {}
-                    config["active_targets"][ticker] = {
-                        "target_price": target_price,
-                        "stop_loss_price": eff_stop,
-                    }
+                    tgt_rec: Dict[str, Any] = {"target_price": eff_target, "stop_loss_price": eff_stop}
+                    if str(signal_type).upper() == "STAGE2_RS":
+                        tgt_rec["strategy_mode"] = "STAGE2_RS"
+                        tgt_rec["peak_price"] = round(actual_px, 2)
+                        tgt_rec["initial_stop_price"] = base_stop
+                    elif stock_data and isinstance(stock_data.get("ATR_14"), (int, float)) and stock_data["ATR_14"] > 0:
+                        tgt_rec["initial_stop_price"] = base_stop
+                    config["active_targets"][ticker] = tgt_rec
                     save_config(config)
 
                 try:
@@ -1001,7 +1087,7 @@ def execute_buy(
                         shares=shares,
                         price=actual_px,
                         order_id=order_id,
-                        target_price=target_price,
+                        target_price=eff_target,
                         stop_loss_price=eff_stop,
                         notes=notes,
                     )
@@ -1021,7 +1107,10 @@ def execute_buy(
                 if "pending_orders" not in config:
                     config["pending_orders"] = {}
                 est_blended = ((existing_shares * existing_acb) + (shares * limit_price)) / (existing_shares + shares) if existing_shares > 0 else limit_price
-                pending_base_stop = round(est_blended * (1.0 - stop_pct / 100.0), 2) if existing_shares > 0 else (stop_loss_price if stop_loss_price else round(limit_price * (1.0 - stop_pct / 100.0), 2))
+                pend_target, pending_base_stop = _recompute_targets_from_fill(
+                    limit_price, est_blended, existing_shares + shares, stop_pct, existing_shares,
+                    target_price, stop_loss_price, stock_data=stock_data if not is_sweep else None, signal_type=signal_type,
+                )
                 config["pending_orders"][ticker] = {
                     "order_id": str(order_id),
                     "action": "BUY",
@@ -1029,11 +1118,14 @@ def execute_buy(
                     "existing_shares": existing_shares,
                     "acb": existing_acb,
                     "limit_price": limit_price,
-                    "target_price": target_price,
+                    "cash_before": round(cash_available, 2),
+                    "target_price": pend_target,
                     "stop_loss_price": _resolve_buy_stop(config, ticker, pending_base_stop, limit_price, existing_shares, blended_acb=est_blended),
+                    "signal_type": signal_type,
+                    "stock_data": {k: stock_data[k] for k in ("ATR_5", "ATR_14", "BB_Mid", "RSI_7", "days_to_ex_dividend") if k in stock_data} if stock_data else None,
                     "reason": notes,
                     "conid": symbol_id,
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "timestamp": now_et_naive().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 save_config(config)
 
@@ -1103,7 +1195,10 @@ def execute_buy(
     new_shares = current_shares + shares
     blended_acb = ((current_shares * existing_acb) + actual_cost) / new_shares if current_shares > 0 else current_price
     stop_pct = config.get("stop_loss_pct", 5.0)
-    base_stop = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if current_shares > 0 else (stop_loss_price if stop_loss_price else round(current_price * (1.0 - stop_pct / 100.0), 2))
+    eff_target, base_stop = _recompute_targets_from_fill(
+        current_price, blended_acb, new_shares, stop_pct, current_shares,
+        target_price, stop_loss_price, stock_data=stock_data if not is_sweep else None, signal_type=signal_type,
+    )
     eff_stop = _resolve_buy_stop(config, ticker, base_stop, current_price, current_shares, blended_acb=blended_acb)
 
     log_trade(ticker, "BUY", shares, current_price, new_shares, new_cash, notes=notes)
@@ -1111,10 +1206,14 @@ def execute_buy(
     if not is_sweep:
         if "active_targets" not in config:
             config["active_targets"] = {}
-        config["active_targets"][ticker] = {
-            "target_price": target_price,
-            "stop_loss_price": eff_stop,
-        }
+        tgt_rec = {"target_price": eff_target, "stop_loss_price": eff_stop}
+        if str(signal_type).upper() == "STAGE2_RS":
+            tgt_rec["strategy_mode"] = "STAGE2_RS"
+            tgt_rec["peak_price"] = round(current_price, 2)
+            tgt_rec["initial_stop_price"] = base_stop
+        elif stock_data and isinstance(stock_data.get("ATR_14"), (int, float)) and stock_data["ATR_14"] > 0:
+            tgt_rec["initial_stop_price"] = base_stop
+        config["active_targets"][ticker] = tgt_rec
         save_config(config)
 
     print(f"[MAPLE SIMULATED TRADE] BOUGHT {shares} {ticker} @ ${current_price:.2f} | Cash: ${new_cash:.2f}")
@@ -1189,7 +1288,8 @@ def execute_sell(
             else:
                 limit_price = round(max(0.01, anchor_price * 0.997), 2)
 
-            print(f"[MAPLE LIVE ORDER] Placing Marketable Limit SELL: {shares} {ticker} @ Limit CAD ${limit_price:.2f} (Account #{account_id}, Reason: {reason})...")
+            acct_ccy = str(config.get("account_currency", "USD")).upper()
+            print(f"[MAPLE LIVE ORDER] Placing Marketable Limit SELL: {shares} {ticker} @ Limit {acct_ccy} ${limit_price:.2f} (Account #{account_id}, Reason: {reason})...")
             order_res = client.place_limit_order(account_id, symbol_id, "Sell", shares, limit_price)
             order_id = order_res.get("orderId")
             if not order_id and "orders" in order_res and order_res["orders"]:
@@ -1224,10 +1324,10 @@ def execute_sell(
                 acb = float(pos.get("averageEntryPrice", current_price))
                 proceeds = round(shares * actual_px, 2)
 
-                bal_after = client.get_balances(account_id)
-                new_cash = float(bal_after.get("cash", 0.0)) if bal_after else 0.0
-
                 default_comm = float(config.get("commission_per_order_cad", 1.0))
+                bal_after = client.get_balances(account_id)
+                est_new_cash = round(max(0.0, cash_before + proceeds - default_comm), 2)
+                new_cash = float(bal_after["cash"]) if (bal_after and "cash" in bal_after) else est_new_cash
                 implied_comm = round(proceeds - (new_cash - cash_before), 2) if (cash_before > 0 and new_cash > cash_before) else -1.0
                 exit_comm = implied_comm if 0.05 <= implied_comm <= 5.00 else default_comm
                 cost_basis_total = shares * acb
@@ -1283,7 +1383,7 @@ def execute_sell(
                     "cash_before": round(cash_before, 2),
                     "reason": reason,
                     "conid": symbol_id,
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "timestamp": now_et_naive().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 save_config(config)
 
@@ -1393,16 +1493,30 @@ def sync_working_orders() -> Dict[str, Any]:
             reason = p_info.get("reason", "")
             action = p_info.get("action", "SELL").upper()
 
-            if status_str == "Filled" or (shares > 0 and cum_fill >= shares):
+            acct_ccy = str(config.get("account_currency", "USD")).upper()
+            is_terminal = status_str in ("Cancelled", "Inactive", "ApiCancelled", "Rejected")
+            is_full_fill = status_str == "Filled" or (shares > 0 and cum_fill >= shares)
+            is_partial_terminal = is_terminal and cum_fill > 0
+
+            if is_full_fill or is_partial_terminal:
+                filled_shs = cum_fill if is_partial_terminal else (cum_fill if cum_fill > 0 else shares)
                 actual_px = limit_px
                 for px_key in ["average_price", "price", "avg_price", "avgPrice"]:
                     if status_res.get(px_key) and float(status_res.get(px_key, 0)) > 0:
                         actual_px = float(status_res.get(px_key))
                         break
 
-                print(f"[MAPLE LIVE FILL CONFIRMED] Order #{order_id} for {shares} {ticker} FILLED @ CAD {actual_px:.2f}!")
+                fill_tag = f"PARTIAL FILL ({filled_shs:g}/{shares:g} shs, {status_str})" if is_partial_terminal else "FILLED"
+                print(f"[MAPLE LIVE FILL CONFIRMED] Order #{order_id} for {filled_shs:g} {ticker} {fill_tag} @ {acct_ccy} {actual_px:.2f}!")
+                default_comm = float(config.get("commission_per_order_cad", 1.0))
+                cash_before = float(p_info.get("cash_before", 0.0))
                 bal_after = client.get_balances(account_id)
-                new_cash = bal_after.get("cash", 0.0)
+                if bal_after and "cash" in bal_after:
+                    new_cash = float(bal_after["cash"])
+                elif action == "SELL":
+                    new_cash = round(max(0.0, cash_before + (filled_shs * actual_px) - default_comm), 2)
+                else:
+                    new_cash = round(max(0.0, cash_before - (filled_shs * actual_px) - default_comm), 2)
 
                 acb = float(p_info.get("acb", 0.0))
                 existing_shs = float(p_info.get("existing_shares", 0.0))
@@ -1410,20 +1524,18 @@ def sync_working_orders() -> Dict[str, Any]:
                     live_positions = client.get_positions(account_id)
                     aliases = set(ticker_aliases(ticker))
                     live_pos = next((p for p in live_positions if normalize_ticker(p.get("symbol", "")) in aliases or p.get("symbol", "").upper() in aliases), None)
-                    new_shares = float(live_pos.get("openQuantity", 0.0)) if live_pos else (0.0 if action == "SELL" else (existing_shs + shares))
+                    new_shares = float(live_pos.get("openQuantity", 0.0)) if live_pos else (0.0 if action == "SELL" else (existing_shs + filled_shs))
                 except Exception:
-                    new_shares = 0.0 if action == "SELL" else (existing_shs + shares)
+                    new_shares = max(0.0, float(shares - filled_shs)) if action == "SELL" else (existing_shs + filled_shs)
                 if acb > 0 and action == "SELL":
-                    proceeds = round(shares * actual_px, 2)
-                    default_comm = float(config.get("commission_per_order_cad", 1.0))
-                    cash_before = float(p_info.get("cash_before", 0.0))
+                    proceeds = round(filled_shs * actual_px, 2)
                     implied_comm = (
                         round(proceeds - (new_cash - cash_before), 2)
                         if (cash_before > 0 and new_cash > cash_before and len(pending) == 1)
                         else -1.0
                     )
                     exit_comm = implied_comm if 0.05 <= implied_comm <= 5.00 else default_comm
-                    cost_basis_total = shares * acb
+                    cost_basis_total = filled_shs * acb
                     pnl = round(proceeds - cost_basis_total - exit_comm, 2)
                     pnl_pct = round((pnl / cost_basis_total) * 100, 2) if cost_basis_total > 0 else 0.0
                 else:
@@ -1431,26 +1543,34 @@ def sync_working_orders() -> Dict[str, Any]:
                     pnl_pct = None
                 pnl_str = f" | P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)" if pnl is not None else ""
 
-                order_note = f"LIVE LIMIT {action} #{order_id} FILLED | {reason}{pnl_str}".strip()
-                log_trade(ticker, action, shares, actual_px, new_shares, new_cash, notes=order_note)
+                order_note = f"LIVE LIMIT {action} #{order_id} {fill_tag} | {reason}{pnl_str}".strip()
+                log_trade(ticker, action, filled_shs, actual_px, new_shares, new_cash, notes=order_note)
 
                 if action == "SELL":
-                    for alias in ticker_aliases(ticker):
-                        if "active_targets" in config and alias in config["active_targets"]:
-                            del config["active_targets"][alias]
-                elif action == "BUY":
+                    if new_shares <= 0.00001:
+                        for alias in ticker_aliases(ticker):
+                            if "active_targets" in config and alias in config["active_targets"]:
+                                del config["active_targets"][alias]
+                elif action == "BUY" and ticker != SWEEP_ETF:
                     if "active_targets" not in config:
                         config["active_targets"] = {}
                     stop_pct = config.get("stop_loss_pct", 5.0)
-                    blended_acb = ((existing_shs * acb) + (shares * actual_px)) / new_shares if (existing_shs > 0 and new_shares > 0) else actual_px
-                    sync_base = round(blended_acb * (1.0 - stop_pct / 100.0), 2) if existing_shs > 0 else (p_info.get("stop_loss_price") or round(blended_acb * (1.0 - stop_pct / 100.0), 2))
+                    blended_acb = ((existing_shs * acb) + (filled_shs * actual_px)) / new_shares if (existing_shs > 0 and new_shares > 0) else actual_px
+                    eff_target, sync_base = _recompute_targets_from_fill(
+                        actual_px, blended_acb, new_shares, stop_pct, existing_shs,
+                        p_info.get("target_price"), p_info.get("stop_loss_price"),
+                        stock_data=p_info.get("stock_data"), signal_type=str(p_info.get("signal_type", "REGULAR")),
+                    )
                     eff_stop = _resolve_buy_stop(config, ticker, float(sync_base), actual_px, existing_shs, blended_acb=blended_acb)
-                    if existing_shs > 0 and isinstance(p_info.get("stop_loss_price"), (int, float)) and p_info["stop_loss_price"] < actual_px:
-                        eff_stop = max(eff_stop, min(round(float(p_info["stop_loss_price"]), 2), round(blended_acb * 0.975, 2)))
-                    config["active_targets"][ticker] = {
-                        "target_price": p_info.get("target_price"),
-                        "stop_loss_price": eff_stop
-                    }
+                    tgt_rec = {"target_price": eff_target, "stop_loss_price": eff_stop}
+                    p_sd = p_info.get("stock_data")
+                    if str(p_info.get("signal_type", "")).upper() == "STAGE2_RS":
+                        tgt_rec["strategy_mode"] = "STAGE2_RS"
+                        tgt_rec["peak_price"] = round(actual_px, 2)
+                        tgt_rec["initial_stop_price"] = float(sync_base)
+                    elif isinstance(p_sd, dict) and isinstance(p_sd.get("ATR_14"), (int, float)) and p_sd["ATR_14"] > 0:
+                        tgt_rec["initial_stop_price"] = float(sync_base)
+                    config["active_targets"][ticker] = tgt_rec
 
                 del updated_pending[raw_ticker]
                 changed = True
@@ -1460,17 +1580,17 @@ def sync_working_orders() -> Dict[str, Any]:
                     send_trade_alert(
                         ticker=ticker,
                         action=action,
-                        shares=shares,
+                        shares=filled_shs,
                         price=actual_px,
                         order_id=order_id,
                         pnl=pnl,
                         pnl_pct=pnl_pct,
-                        notes=f"FILLED on IBKR book: {reason}"
+                        notes=f"{fill_tag} on IBKR book: {reason}"
                     )
                 except Exception:
                     pass
 
-            elif status_str in ["Cancelled", "Inactive"] and cum_fill == 0:
+            elif is_terminal and cum_fill <= 0:
                 print(f"[MAPLE LIVE ORDER EXPIRED] Order #{order_id} for {ticker} was {status_str} unfilled on broker. Position retained.")
                 del updated_pending[raw_ticker]
                 changed = True
@@ -1486,18 +1606,8 @@ def sync_working_orders() -> Dict[str, Any]:
 
 
 def _count_trading_days(start_dt: datetime.datetime, end_dt: datetime.datetime) -> int:
-    """Counts weekday (Mon-Fri) sessions elapsed between start_dt.date() and end_dt.date()."""
-    d0 = start_dt.date() if isinstance(start_dt, datetime.datetime) else start_dt
-    d1 = end_dt.date() if isinstance(end_dt, datetime.datetime) else end_dt
-    if d1 <= d0:
-        return 0
-    days = 0
-    cur = d0 + datetime.timedelta(days=1)
-    while cur <= d1:
-        if cur.weekday() < 5:
-            days += 1
-        cur += datetime.timedelta(days=1)
-    return days
+    """Counts NYSE trading sessions (excluding weekends and NYSE holidays) elapsed between start_dt and end_dt."""
+    return max(0, count_nyse_trading_days(start_dt, end_dt))
 
 
 def get_position_holding_days(active_tickers: Optional[set] = None) -> Dict[str, int]:
@@ -1547,7 +1657,7 @@ def get_position_holding_days(active_tickers: Optional[set] = None) -> Dict[str,
     except Exception:
         return {}
 
-    now = datetime.datetime.now()
+    now = now_et_naive()
     return {
         t: _count_trading_days(dt, now)
         for t, dt in first_buy_dates.items()
@@ -1706,13 +1816,17 @@ def check_target_stops(
     market_data: Optional[Dict[str, Dict[str, Any]]] = None,
     allow_stagnation_exit: bool = False,
     is_chop_window: bool = False,
+    is_eod_window: bool = False,
+    top_keep_tickers: Optional[set] = None,
 ):
-    """Automatically executes exits if prices touch target sell, protective stop, or 4-day bearish stagnation,
-    and ratchets stop-losses to breakeven once a position reaches >= +2.0% unrealized gain.
-    """
+    """Automatically executes exits across Stage-2 Multi-Week Swing (Variant D) and legacy swing positions."""
     sync_working_orders()
     state = get_ledger_state()
     config = load_config()
+    if config.get("trading_mode", "").upper() == "LIVE" and state.get("live_fallback"):
+        print("[MAPLE LIVE HALT] Skipping check_target_stops: broker gateway unreachable/unauthenticated.")
+        return
+    acct_ccy = str(config.get("account_currency", "USD")).upper()
     active_targets = config.get("active_targets", {})
     init_portfolio = config.get("initial_portfolio", {})
     held_set = {normalize_ticker(t) for t, p in state["positions"].items() if p.get("shares", 0) > 0}
@@ -1778,60 +1892,168 @@ def check_target_stops(
         if earn_td is None and sd_pos:
             earn_td = sd_pos.get("days_to_earnings")
         near_earnings = isinstance(earn_td, (int, float)) and 0 <= earn_td <= 3
+        is_stage2_pos = bool(target_info and str(target_info.get("strategy_mode", "")).upper() == "STAGE2_RS")
+
+        if is_stage2_pos:
+            comm_per_order = float(config.get("commission_per_order_cad", MapleStrategy.COMMISSION_PER_ORDER_CAD))
+            comm_mult = 1.0 if (state.get("mode") == "LIVE" and state.get("live_verified")) else 2.0
+            comm_breakeven = round(acb + (comm_mult * comm_per_order) / max(1.0, float(shares)), 2)
+            prev_peak = float(target_info.get("peak_price") or acb)
+            peak_px = round(max(prev_peak, float(price)), 2)
+            atr_ref = (
+                float(sd_pos["ATR_14"])
+                if (sd_pos and isinstance(sd_pos.get("ATR_14"), (int, float)) and sd_pos["ATR_14"] > 0)
+                else (acb * 0.025)
+            )
+            cand_stop = float(stop) if stop is not None else round(acb - MapleStrategy.STAGE2_HARD_STOP_ATR_MULT * atr_ref, 2)
+            tag = ""
+            if peak_px >= acb * 1.08 or (near_earnings and price >= round(acb * 1.003, 2)):
+                be_px = comm_breakeven if price >= round(comm_breakeven * 1.004, 2) else round(acb, 2)
+                if be_px < price and be_px > cand_stop:
+                    cand_stop = be_px
+                    tag = "STAGE-2 BREAKEVEN FLOOR"
+            chand_stop = round(peak_px - MapleStrategy.STAGE2_TRAIL_STOP_ATR_MULT * atr_ref, 2)
+            if chand_stop < price and chand_stop > cand_stop:
+                cand_stop = chand_stop
+                tag = "STAGE-2 CATASTROPHIC ATR TRAIL"
+
+            if (stop is None or cand_stop > stop) or peak_px > prev_peak:
+                old_stop = stop
+                if cand_stop < price and (stop is None or cand_stop > stop):
+                    stop = cand_stop
+                config = load_config()
+                rec = config.setdefault("active_targets", {}).setdefault(matched_alias, {})
+                rec["strategy_mode"] = "STAGE2_RS"
+                rec["target_price"] = target
+                rec["stop_loss_price"] = stop
+                rec["peak_price"] = peak_px
+                save_config(config)
+                active_targets = config.get("active_targets", {})
+                if tag and stop != old_stop:
+                    gain_pct = ((price - acb) / acb) * 100.0 if acb > 0 else 0.0
+                    print(f"[MAPLE {tag}] Ratcheted hard stop for {ticker} from {acct_ccy} {old_stop} to {acct_ccy} {stop:.2f} (Peak {acct_ccy} {peak_px:.2f}, +{gain_pct:.2f}%)")
+
+            # Layer 1: Intraday Catastrophic Hard Stop (with Opening Chop Buffer 9:30-10:00 AM ET)
+            if stop is not None:
+                chop_buf_pct = float(config.get("chop_stop_buffer_pct", 2.0)) if is_chop_window else 0.0
+                eff_stop = round(stop * (1.0 - chop_buf_pct / 100.0), 2) if chop_buf_pct > 0 else stop
+                if price <= eff_stop:
+                    stop_label = f"Chop-Buffered Hard Stop {acct_ccy} {eff_stop:.2f} [Base {acct_ccy} {stop:.2f}]" if chop_buf_pct > 0 else f"Hard Stop {acct_ccy} {stop:.2f}"
+                    execute_sell(ticker, price, reason=f"AUTO STOP-LOSS HIT: {acct_ccy} {price:.2f} ({stop_label})")
+                    config = load_config()
+                    active_targets = config.get("active_targets", {})
+                    continue
+
+            # Layer 2: Close-Confirmed Hybrid SMA_50 / EMA_21 Trend Exit (evaluated near close after >= 5 trading days)
+            days_held = holding_days.get(ticker, 0)
+            if is_eod_window and not is_chop_window and sd_pos and days_held >= MapleStrategy.STAGE2_MIN_HOLD_DAYS:
+                sma_50 = sd_pos.get("SMA_50")
+                ema_21 = sd_pos.get("EMA_21")
+                gain_pct = ((price - acb) / acb) * 100.0 if acb > 0 else 0.0
+                outside_keep = (top_keep_tickers is not None) and (ticker not in top_keep_tickers)
+                if isinstance(sma_50, (int, float)) and sma_50 > 0 and price < sma_50:
+                    execute_sell(
+                        ticker,
+                        price,
+                        reason=f"AUTO STAGE-2 SMA_50 EXIT: Close {acct_ccy} {price:.2f} < SMA_50 ({acct_ccy} {sma_50:.2f}) after {days_held}d ({gain_pct:+.2f}%)",
+                    )
+                    config = load_config()
+                    active_targets = config.get("active_targets", {})
+                    continue
+                if isinstance(ema_21, (int, float)) and ema_21 > 0 and price < ema_21 and (gain_pct >= MapleStrategy.STAGE2_PROFIT_HARVEST_PCT or outside_keep):
+                    why = f"+{gain_pct:.1f}% profit harvest" if gain_pct >= MapleStrategy.STAGE2_PROFIT_HARVEST_PCT else "RS faded outside Top-20"
+                    execute_sell(
+                        ticker,
+                        price,
+                        reason=f"AUTO STAGE-2 EMA_21 EXIT: Close {acct_ccy} {price:.2f} < EMA_21 ({acct_ccy} {ema_21:.2f}) [{why}]",
+                    )
+                    config = load_config()
+                    active_targets = config.get("active_targets", {})
+                    continue
+            continue
 
         if acb > 0 and price > acb:
             gain_pct = ((price - acb) / acb) * 100.0
             target_progress = ((price - acb) / (target - acb)) if (target and target > acb) else 0.0
-            if (
+            init_stop = target_info.get("initial_stop_price") if target_info else None
+            use_r_ratchet = isinstance(init_stop, (int, float)) and 0 < init_stop < acb
+            comm_per_order = float(config.get("commission_per_order_cad", MapleStrategy.COMMISSION_PER_ORDER_CAD))
+            # IBKR LIVE avgCost (acb) already includes entry commission; SIMULATED acb is raw fill price
+            comm_mult = 1.0 if (state.get("mode") == "LIVE" and state.get("live_verified")) else 2.0
+            comm_breakeven = round(acb + (comm_mult * comm_per_order) / max(1.0, float(shares)), 2)
+            raw_breakeven = round(acb, 2)
+            candidate_stop = None
+            tag = ""
+
+            if use_r_ratchet:
+                r_unit = max(0.01, float(acb - init_stop))
+                r_gain = (price - acb) / r_unit
+                atr_trail = (
+                    float(sd_pos["ATR_14"])
+                    if (sd_pos and isinstance(sd_pos.get("ATR_14"), (int, float)) and sd_pos["ATR_14"] > 0)
+                    else (r_unit / MapleStrategy.ATR_STOP_MULTIPLIER)
+                )
+                if r_gain >= 0.8 or (near_earnings and price >= round(acb * 1.003, 2)):
+                    candidate_stop = round(acb - 0.5 * r_unit, 2)
+                    tag = "HALF-RISK RATCHET (-0.5R)"
+                if r_gain >= 1.0 or (near_earnings and price >= round(acb * 1.003, 2)):
+                    be_stop = comm_breakeven if price >= round(comm_breakeven * 1.004, 2) else raw_breakeven
+                    if candidate_stop is None or be_stop > candidate_stop:
+                        candidate_stop = be_stop
+                    tag = "EARNINGS BREAKEVEN RATCHET" if (near_earnings and r_gain < 1.0) else "BREAKEVEN RATCHET (+1.0R)"
+                if r_gain >= 1.5:
+                    lock_stop = round(comm_breakeven + 0.75 * r_unit, 2)
+                    if price >= round(lock_stop * 1.004, 2) and (candidate_stop is None or lock_stop > candidate_stop):
+                        candidate_stop = lock_stop
+                        tag = "PROFIT-LOCK RATCHET (+0.75R NET)"
+                if r_gain >= 2.0:
+                    trail_stop = round(price - 1.5 * atr_trail, 2)
+                    if candidate_stop is None or trail_stop > candidate_stop:
+                        candidate_stop = trail_stop
+                        tag = "ATR TRAILING STOP RATCHET (+2.0R)"
+            elif (
                 gain_pct >= MapleStrategy.HALF_RISK_TRIGGER_PCT
                 or gain_pct >= MapleStrategy.BREAKEVEN_TRIGGER_PCT
                 or target_progress >= 0.75
                 or (near_earnings and price >= round(acb * 1.003, 2))
             ):
-                comm_per_order = float(config.get("commission_per_order_cad", MapleStrategy.COMMISSION_PER_ORDER_CAD))
-                # IBKR LIVE avgCost (acb) already includes entry commission; SIMULATED acb is raw fill price
-                comm_mult = 1.0 if (state.get("mode") == "LIVE" and state.get("live_verified")) else 2.0
-                comm_breakeven = round(acb + (comm_mult * comm_per_order) / max(1.0, float(shares)), 2)
-                raw_breakeven = round(acb, 2)
-                # Tier 0.5: Half-Risk (-2.5% below ACB once gain >= +2.0%)
+                # Legacy %-tier ratchets for pre-existing positions without initial_stop_price
                 candidate_stop = round(acb * 0.975, 2)
                 tag = "HALF-RISK RATCHET (-2.5%)"
-                # Tier 1: Breakeven (once gain >= +2.5%, target_progress >= 75%, or near earnings with >= +0.3% cushion)
                 if gain_pct >= MapleStrategy.BREAKEVEN_TRIGGER_PCT or target_progress >= 0.75 or (near_earnings and price >= round(acb * 1.003, 2)):
                     be_stop = comm_breakeven if price >= round(comm_breakeven * 1.004, 2) else raw_breakeven
                     if be_stop > candidate_stop:
                         candidate_stop = be_stop
                     tag = "EARNINGS BREAKEVEN RATCHET" if (near_earnings and gain_pct < MapleStrategy.BREAKEVEN_TRIGGER_PCT) else "BREAKEVEN RATCHET"
-                # Tier 2: Profit-Lock (+1.5% net above comm_breakeven once gain >= +3.0% or >= 75% to target)
                 if gain_pct >= 3.0 or target_progress >= 0.75:
                     lock_stop = round(comm_breakeven * 1.015, 2)
                     if price >= round(lock_stop * 1.004, 2) and lock_stop > candidate_stop:
                         candidate_stop = lock_stop
                         tag = "PROFIT-LOCK RATCHET (+1.5% NET)"
-                # Tier 3: High-Flyer Trail (1.25% below live price once gain >= +4.0%)
                 if gain_pct >= 4.0:
                     trail_stop = round(price * 0.9875, 2)
                     if trail_stop > candidate_stop:
                         candidate_stop = trail_stop
                         tag = "TRAILING STOP RATCHET (-1.25%)"
-                if candidate_stop < price and (stop is None or candidate_stop > stop):
-                    old_stop = stop
-                    stop = candidate_stop
-                    config = load_config()
-                    active_targets = config.get("active_targets", {})
-                    config.setdefault("active_targets", {}).setdefault(matched_alias, {})["target_price"] = target
-                    config["active_targets"][matched_alias]["stop_loss_price"] = stop
-                    save_config(config)
-                    print(
-                        f"[MAPLE {tag}] Ratcheted stop-loss for {ticker} from CAD {old_stop} to CAD {stop:.2f} (Price CAD {price:.2f}, +{gain_pct:.2f}%)"
-                    )
+
+            if candidate_stop is not None and candidate_stop < price and (stop is None or candidate_stop > stop):
+                old_stop = stop
+                stop = candidate_stop
+                config = load_config()
+                active_targets = config.get("active_targets", {})
+                config.setdefault("active_targets", {}).setdefault(matched_alias, {})["target_price"] = target
+                config["active_targets"][matched_alias]["stop_loss_price"] = stop
+                save_config(config)
+                print(
+                    f"[MAPLE {tag}] Ratcheted stop-loss for {ticker} from {acct_ccy} {old_stop} to {acct_ccy} {stop:.2f} (Price {acct_ccy} {price:.2f}, +{gain_pct:.2f}%)"
+                )
 
         # 1. Target Hit
         if target is not None and price >= target:
             execute_sell(
                 ticker,
                 price,
-                reason=f"AUTO TARGET HIT: CAD {price:.2f} (Target CAD {target:.2f})",
+                reason=f"AUTO TARGET HIT: {acct_ccy} {price:.2f} (Target {acct_ccy} {target:.2f})",
             )
             config = load_config()
             active_targets = config.get("active_targets", {})
@@ -1842,19 +2064,19 @@ def check_target_stops(
             chop_buf_pct = float(config.get("chop_stop_buffer_pct", 2.0)) if is_chop_window else 0.0
             eff_stop = round(stop * (1.0 - chop_buf_pct / 100.0), 2) if chop_buf_pct > 0 else stop
             if price <= eff_stop:
-                stop_label = f"Chop-Buffered Stop CAD {eff_stop:.2f} [Base CAD {stop:.2f}]" if chop_buf_pct > 0 else f"Stop CAD {stop:.2f}"
+                stop_label = f"Chop-Buffered Stop {acct_ccy} {eff_stop:.2f} [Base {acct_ccy} {stop:.2f}]" if chop_buf_pct > 0 else f"Stop {acct_ccy} {stop:.2f}"
                 execute_sell(
                     ticker,
                     price,
-                    reason=f"AUTO STOP-LOSS HIT: CAD {price:.2f} ({stop_label})",
+                    reason=f"AUTO STOP-LOSS HIT: {acct_ccy} {price:.2f} ({stop_label})",
                 )
                 config = load_config()
                 active_targets = config.get("active_targets", {})
                 continue
             elif is_chop_window and price <= stop:
                 print(
-                    f"[MAPLE CHOP BUFFER] {ticker} dipped to CAD {price:.2f} (<= base stop CAD {stop:.2f}), "
-                    f"holding above opening-chop floor CAD {eff_stop:.2f} (-{chop_buf_pct:.1f}% buffer until 10:00 AM)."
+                    f"[MAPLE CHOP BUFFER] {ticker} dipped to {acct_ccy} {price:.2f} (<= base stop {acct_ccy} {stop:.2f}), "
+                    f"holding above opening-chop floor {acct_ccy} {eff_stop:.2f} (-{chop_buf_pct:.1f}% buffer until 10:00 AM)."
                 )
 
         # 3. Autonomous Stagnation Exit (Held >= STAGNATION_DAYS, negative P&L, Bearish EMA5 < EMA9 OR Price < both EMAs)

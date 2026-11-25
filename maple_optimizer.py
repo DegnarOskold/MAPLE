@@ -27,7 +27,7 @@ CHANGELOG_FILE = os.path.join(MAPLE_DIR, "maple_logic_changelog.md")
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
 TRADES_FILE = os.path.join(MAPLE_DIR, "maple_trades.csv")
 
-from maple_market import get_stock_data, get_corporate_calendar, prefetch_histories, get_macro_alignment, is_macro_aligned
+from maple_market import get_stock_data, get_corporate_calendar, prefetch_histories, get_macro_alignment, is_macro_aligned, now_et_naive
 from maple_ledger import (
     load_config,
     save_config,
@@ -46,7 +46,7 @@ from maple_strategy import MapleStrategy
 
 
 def log_to_changelog(entry: str):
-    now = datetime.datetime.now()
+    now = now_et_naive()
     today_str = now.strftime("%Y-%m-%d")
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     new_block = f"### Optimization Log [{timestamp}]\n{entry}\n"
@@ -177,6 +177,8 @@ def _classify_buy_bucket(notes: str, ticker: str = "") -> str:
     notes_up = (notes or "").upper()
     if (ticker and normalize_ticker(ticker) == SWEEP_ETF) or "IDLE-CASH SWEEP" in notes_up or "SWEEP UNWIND" in notes_up:
         return "Idle-Cash Sweep"
+    if "STAGE2_RS" in notes_up or "STAGE-2" in notes_up:
+        return "Stage-2 RS Leader"
     if "CAPITULATION" in notes_up:
         return "Capitulation Reversal"
     if "LOW-VOLUME" in notes_up or "SCALED" in notes_up:
@@ -396,7 +398,29 @@ def scan_missed_opportunities(
             day_gain = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
 
             if day_gain >= 2.0 or (day_gain > 0 and pct_from_low >= 2.5):
-                tranche_pct, gate_reason = MapleStrategy.calculate_tranche_size(data)
+                MapleStrategy._sync_from_config()
+                use_stage2 = (
+                    "RS_Score" in data
+                    and "SMA_200" in data
+                    and str(load_config().get("strategy_mode", "")).upper() == "STAGE2_RS"
+                )
+                if use_stage2:
+                    tranche_pct, gate_reason = MapleStrategy.evaluate_stage2_entry(data)
+                else:
+                    rsi_v = data.get("RSI_7")
+                    vr_v = data.get("Vol_Ratio")
+                    if (
+                        isinstance(rsi_v, (int, float))
+                        and rsi_v < MapleStrategy.RSI_OVERSOLD_MAX
+                        and isinstance(vr_v, (int, float))
+                        and vr_v >= MapleStrategy.VOLUME_CAPITULATION_RATIO
+                    ):
+                        sig_t = "CAPITULATION REVERSAL"
+                    elif isinstance(vr_v, (int, float)) and vr_v < MapleStrategy.VOLUME_CAPITULATION_RATIO:
+                        sig_t = "LOW-VOLUME SCALED ENTRY"
+                    else:
+                        sig_t = "REGULAR BUY"
+                    tranche_pct, gate_reason = MapleStrategy.calculate_tranche_size(data, signal_type=sig_t)
                 eligible = tranche_pct > 0.0
                 if eligible:
                     gate_status = f"ELIGIBLE ({tranche_pct*100:.0f}%)"
@@ -430,8 +454,8 @@ def scan_missed_opportunities(
 
 
 def run_daily_self_assessment():
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    print(f"\n[MAPLE DAILY RETROSPECTIVE] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    today_str = now_et_naive().strftime("%Y-%m-%d")
+    print(f"\n[MAPLE DAILY RETROSPECTIVE] {now_et_naive().strftime('%Y-%m-%d %H:%M:%S')} ET")
 
     state = get_ledger_state()
     config = load_config()
@@ -522,7 +546,8 @@ def run_daily_self_assessment():
         sec = pa.get("sector", "Other")
         sector_totals[sec] = sector_totals.get(sec, 0.0) + float(pa.get("market_value", 0.0))
 
-    # Count today's BUY entries by signal bucket (separating Idle-Cash Sweep)
+    # Count today's BUY entries by signal bucket (separating Stage-2 RS & Idle-Cash Sweep)
+    stage2_buys = sum(1 for b in buy_trades if b["bucket"] == "Stage-2 RS Leader")
     reg_buys = sum(1 for b in buy_trades if b["bucket"] == "Regular Trend")
     scaled_buys = sum(1 for b in buy_trades if b["bucket"] == "Low-Volume Scaled")
     cap_buys = sum(1 for b in buy_trades if b["bucket"] == "Capitulation Reversal")
@@ -571,9 +596,10 @@ def run_daily_self_assessment():
             f"[DRAWDOWN AUDIT] Daily NAV delta {daily_pct:+.2f}% (USD {daily_pnl:+.2f}){worst_str}."
         )
     if buy_trades:
+        stage2_prefix = f"{stage2_buys} Stage-2 RS Leader, " if stage2_buys > 0 else ""
         sweep_suffix = f", {sweep_buys} Idle-Cash Sweep" if sweep_buys > 0 else ""
         audit_flags.append(
-            f"[SIGNAL ATTRIBUTION] Today's BUY fills ({len(buy_trades)}): {reg_buys} Regular Trend, {scaled_buys} Low-Volume Scaled, {cap_buys} Capitulation Reversal{sweep_suffix}."
+            f"[SIGNAL ATTRIBUTION] Today's BUY fills ({len(buy_trades)}): {stage2_prefix}{reg_buys} Regular Trend, {scaled_buys} Low-Volume Scaled, {cap_buys} Capitulation Reversal{sweep_suffix}."
         )
     realized_with_pnl = [rt for rt in realized_trades if rt.get("pnl") is not None]
     if realized_with_pnl:
@@ -650,10 +676,10 @@ def run_daily_self_assessment():
     ])
 
     if sector_totals and equity > 0:
-        report.append("\n**Sector Exposure Breakdown (Cap 35.0%):**")
+        report.append(f"\n**Sector Exposure Breakdown (Cap {max_sector_pct:.1f}%):**")
         for sec, val in sorted(sector_totals.items(), key=lambda x: x[1], reverse=True):
             sec_pct = (val / equity) * 100.0
-            breach_tag = " ⚠️ [OVER 35% CAP]" if (sec != "Shariah ETF (Sweep)" and sec_pct > max_sector_pct) else ""
+            breach_tag = f" ⚠️ [OVER {max_sector_pct:.0f}% CAP]" if (sec != "Shariah ETF (Sweep)" and sec_pct > max_sector_pct) else ""
             report.append(f"- **{sec}**: USD {val:.2f} (`{sec_pct:.1f}%` of NAV){breach_tag}")
 
     if buy_trades:
@@ -708,7 +734,7 @@ def run_daily_self_assessment():
         for item in status_items:
             report.append(f"- {item}")
     else:
-        report.append("\n**Autonomous Strategy Action:** All sector caps (<= 35%), stop buffers, and daily drawdown metrics within operating thresholds.")
+        report.append(f"\n**Autonomous Strategy Action:** All sector caps (<= {max_sector_pct:.0f}%), stop buffers, and daily drawdown metrics within operating thresholds.")
 
     log_entry = "\n".join(report)
     log_to_changelog(log_entry)

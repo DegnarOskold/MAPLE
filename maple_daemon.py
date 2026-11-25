@@ -16,13 +16,14 @@ if MAPLE_DIR not in sys.path:
     sys.path.insert(0, MAPLE_DIR)
 
 from maple_brain import run_intraday_scan, is_market_open
+from maple_market import now_et_naive, is_nyse_trading_day, is_nyse_holiday, get_nyse_close_hour_min
 from maple_optimizer import run_daily_self_assessment
 from maple_ledger import get_ledger_state
 
 
 def get_seconds_until_next_interval() -> int:
     """Calculates seconds until the next :00, :15, :30, or :45 minute mark."""
-    now = datetime.datetime.now()
+    now = now_et_naive()
     minutes = now.minute
     seconds = now.second
     next_quarter = ((minutes // 15) + 1) * 15
@@ -47,16 +48,19 @@ def start_daemon():
 
     while True:
         try:
-            now = datetime.datetime.now()
+            now = now_et_naive()
             today_str = now.strftime("%Y-%m-%d")
 
-            # 1. Market Hours Check (09:30 - 16:00 ET Mon-Fri)
+            # 1. Market Hours Check (NYSE regular trading hours in ET, respecting holidays & 1:00 PM early closes)
             if is_market_open():
-                print(f"\n[DAEMON WAKEUP] {now.strftime('%Y-%m-%d %H:%M:%S')} - Running live market scan...")
+                print(f"\n[DAEMON WAKEUP] {now.strftime('%Y-%m-%d %H:%M:%S')} ET - Running live market scan...")
                 run_intraday_scan()
             else:
-                # 2. Post-Close Daily Retrospective at ~16:10 ET Mon-Fri
-                if now.weekday() < 5 and now.hour == 16 and 5 <= now.minute <= 25:
+                close_h, close_m = get_nyse_close_hour_min(now.date())
+                close_dt = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+                mins_after_close = (now - close_dt).total_seconds() / 60.0
+                # 2. Post-Close Daily Retrospective 5-25 min after NYSE close on valid trading days only
+                if is_nyse_trading_day(now.date()) and 5.0 <= mins_after_close <= 25.0:
                     if last_retrospective_date != today_str:
                         print(f"\n[DAEMON] Running daily post-close self-assessment...")
                         run_daily_self_assessment()
@@ -64,16 +68,18 @@ def start_daemon():
                 else:
                     if now.weekday() >= 5:
                         status = "Weekend (Markets Closed)"
+                    elif is_nyse_holiday(now.date()):
+                        status = "NYSE Holiday (Markets Closed)"
                     elif now.hour < 9 or (now.hour == 9 and now.minute < 30):
                         status = "Pre-Market (Opens 9:30 AM ET)"
                     else:
                         status = "After-Hours (Markets Closed)"
-                    print(f"[{now.strftime('%H:%M:%S')}] {status} - Standing by.")
+                    print(f"[{now.strftime('%H:%M:%S')} ET] {status} - Standing by.")
 
-            # Calculate sleep duration to next 30-min boundary
+            # Calculate sleep duration to next 15-min boundary
             sleep_sec = get_seconds_until_next_interval()
-            next_run = datetime.datetime.now() + datetime.timedelta(seconds=sleep_sec)
-            print(f"Sleeping {sleep_sec // 60}m {sleep_sec % 60}s (Next scan at {next_run.strftime('%H:%M:%S')})...")
+            next_run = now_et_naive() + datetime.timedelta(seconds=sleep_sec)
+            print(f"Sleeping {sleep_sec // 60}m {sleep_sec % 60}s (Next scan at {next_run.strftime('%H:%M:%S')} ET)...")
             time.sleep(sleep_sec)
 
         except KeyboardInterrupt:

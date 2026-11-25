@@ -112,7 +112,7 @@ class IBKRClient:
                 }
         except Exception:
             pass
-        return {"cash": 0.0, "total_equity": 0.0, "market_value": 0.0, "buying_power": 0.0}
+        return {}
 
     def get_positions(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
         if not account_id:
@@ -384,26 +384,34 @@ class IBKRClient:
         except Exception as e:
             raise RuntimeError(f"IBKR order placement request failed: {e}")
 
-        # Handle questions/warnings if returned (replyId loop)
+        # Handle questions/warnings if returned (replyId loop), blocking margin/unsettled-cash/shorting prompts
+        unsafe_keywords = (
+            "margin", "loan", "leverage", "insufficient cash", "settled cash",
+            "unsettled", "good faith", "free riding", "short sale", "short position", "borrow",
+        )
         for _ in range(5):
-            reply_id = None
-            msg = ""
-            if isinstance(res, list) and res and isinstance(res[0], dict) and "id" in res[0]:
-                reply_id = res[0]["id"]
-                msg = res[0].get("message", [""])[0] if isinstance(res[0].get("message"), list) else str(res[0].get("message"))
-            elif isinstance(res, dict) and "id" in res:
-                reply_id = res["id"]
-                msg = res.get("message", [""])[0] if isinstance(res.get("message"), list) else str(res.get("message"))
-
-            if reply_id:
-                print(f"[IBKR CONFIRMATION REQUIRED] {msg} -> Auto-confirming replyId: {reply_id}")
+            first = res[0] if (isinstance(res, list) and res and isinstance(res[0], dict)) else (res if isinstance(res, dict) else None)
+            if not first or "order_id" in first or "orderId" in first:
+                break
+            reply_id = first.get("id")
+            if not reply_id:
+                break
+            raw_msg = first.get("message", "")
+            msg = " ".join(str(m) for m in raw_msg) if isinstance(raw_msg, list) else str(raw_msg)
+            msg_low = msg.lower()
+            if any(k in msg_low for k in unsafe_keywords):
+                print(f"[IBKR SAFETY REJECT] Blocking unsafe broker prompt (replyId {reply_id}): {msg}")
                 try:
-                    reply_res = self.session.post(f"{self.base_url}/iserver/reply/{reply_id}", json={"confirmed": True}, timeout=10).json()
-                    res = reply_res
-                except Exception as e:
-                    print(f"[IBKR CONFIRMATION ERROR] Failed to confirm replyId {reply_id}: {e}")
-                    break
-            else:
+                    self.session.post(f"{self.base_url}/iserver/reply/{reply_id}", json={"confirmed": False}, timeout=5)
+                except Exception:
+                    pass
+                return {"orderId": None, "orders": [], "raw_response": res, "rejected_reason": msg}
+
+            print(f"[IBKR CONFIRMATION REQUIRED] {msg} -> Auto-confirming replyId: {reply_id}")
+            try:
+                res = self.session.post(f"{self.base_url}/iserver/reply/{reply_id}", json={"confirmed": True}, timeout=10).json()
+            except Exception as e:
+                print(f"[IBKR CONFIRMATION ERROR] Failed to confirm replyId {reply_id}: {e}")
                 break
 
         # Extract orderId

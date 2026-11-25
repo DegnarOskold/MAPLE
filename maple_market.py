@@ -8,10 +8,22 @@ import os
 import json
 import time
 import datetime
+from functools import lru_cache
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar,
+    GoodFriday,
+    Holiday,
+    USLaborDay,
+    USMartinLutherKingJr,
+    USMemorialDay,
+    USPresidentsDay,
+    USThanksgivingDay,
+    nearest_workday,
+)
 import pandas_ta as ta
 import yfinance as yf
 
@@ -29,10 +41,93 @@ GOLD_LINKED_TICKERS = {"NEM", "FCX", "ABX.TO", "AEM.TO", "FNV.TO", "WPM.TO", "PA
 OIL_LINKED_TICKERS = {"XOM", "CVX", "COP", "EOG", "SLB", "CNQ.TO", "SU.TO", "IMO.TO", "CVE.TO"}
 
 
+def _nyse_new_years_observance(dt: datetime.datetime) -> Optional[datetime.datetime]:
+    if dt.weekday() == 6:
+        return dt + datetime.timedelta(days=1)
+    if dt.weekday() == 5:
+        return None
+    return dt
+
+
+class _NYSEHolidayCalendar(AbstractHolidayCalendar):
+    rules = [
+        Holiday("New Years Day", month=1, day=1, observance=_nyse_new_years_observance),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday("Juneteenth", month=6, day=19, observance=nearest_workday),
+        Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("Christmas", month=12, day=25, observance=nearest_workday),
+    ]
+
+
+_NYSE_CAL = _NYSEHolidayCalendar()
+
+
+@lru_cache(maxsize=16)
+def _nyse_holidays_for_year(year: int) -> frozenset:
+    ts = _NYSE_CAL.holidays(start=f"{year}-01-01", end=f"{year}-12-31")
+    return frozenset(d.date() for d in ts)
+
+
+def is_nyse_holiday(d: datetime.date) -> bool:
+    d_val = d.date() if isinstance(d, datetime.datetime) else d
+    return d_val in _nyse_holidays_for_year(d_val.year)
+
+
+def is_nyse_trading_day(d: datetime.date) -> bool:
+    d_val = d.date() if isinstance(d, datetime.datetime) else d
+    return d_val.weekday() < 5 and not is_nyse_holiday(d_val)
+
+
+def is_nyse_early_close(d: datetime.date) -> bool:
+    """True on 1:00 PM ET NYSE half-days: Black Friday, weekday Dec 24, and weekday Jul 3."""
+    d_val = d.date() if isinstance(d, datetime.datetime) else d
+    if not is_nyse_trading_day(d_val):
+        return False
+    if d_val.month == 11 and d_val.weekday() == 4 and 24 <= d_val.day <= 30:
+        if is_nyse_holiday(d_val - datetime.timedelta(days=1)):
+            return True
+    if d_val.month == 12 and d_val.day == 24:
+        return True
+    if d_val.month == 7 and d_val.day == 3:
+        return True
+    return False
+
+
+def get_nyse_close_hour_min(d: datetime.date) -> Tuple[int, int]:
+    return (13, 0) if is_nyse_early_close(d) else (16, 0)
+
+
+def count_nyse_trading_days(d0: datetime.date, d1: datetime.date) -> int:
+    """Counts NYSE trading sessions in (d0, d1] (negative if d1 < d0), excluding weekends and NYSE holidays."""
+    s = d0.date() if isinstance(d0, datetime.datetime) else d0
+    e = d1.date() if isinstance(d1, datetime.datetime) else d1
+    if e == s:
+        return 0
+    if e < s:
+        return -count_nyse_trading_days(e, s)
+    days = 0
+    cur = s + datetime.timedelta(days=1)
+    while cur <= e:
+        if is_nyse_trading_day(cur):
+            days += 1
+        cur += datetime.timedelta(days=1)
+    return days
+
+
 def _now_et() -> datetime.datetime:
     if _ET_TZ is not None:
         return datetime.datetime.now(_ET_TZ)
     return datetime.datetime.now()
+
+
+def now_et_naive() -> datetime.datetime:
+    """Returns current America/New_York wall-clock time as a naive datetime matching ledger/CSV timestamps."""
+    return _now_et().replace(tzinfo=None)
 
 
 def _refresh_calendar_days(
@@ -41,7 +136,6 @@ def _refresh_calendar_days(
 ) -> Dict[str, Dict[str, Any]]:
     """Dynamically recomputes calendar and trading-day deltas from cached ISO dates on every read."""
     today = ref_date or _now_et().date()
-    today_iso = today.isoformat()
     out: Dict[str, Dict[str, Any]] = {}
     for sym, entry in calendar_data.items():
         rec = dict(entry)
@@ -50,7 +144,17 @@ def _refresh_calendar_days(
             try:
                 ed_date = datetime.date.fromisoformat(ed_str[:10])
                 rec["days_to_earnings"] = (ed_date - today).days
-                rec["trading_days_to_earnings"] = int(np.busday_count(today_iso, ed_date.isoformat()))
+                # np.busday_count treats [today, ed_date) half-open: Fri->Tue = 2 (Fri + Mon). Match NYSE trading sessions in [today, ed_date).
+                if ed_date >= today:
+                    td = 0
+                    cur = today
+                    while cur < ed_date:
+                        if is_nyse_trading_day(cur):
+                            td += 1
+                        cur += datetime.timedelta(days=1)
+                    rec["trading_days_to_earnings"] = td
+                else:
+                    rec["trading_days_to_earnings"] = -count_nyse_trading_days(ed_date, today)
             except ValueError:
                 pass
         else:
@@ -127,10 +231,11 @@ def get_corporate_calendar(
 
 def _is_tsx_regular_hours(now_et: Optional[datetime.datetime] = None) -> bool:
     dt = now_et or _now_et()
-    if dt.weekday() >= 5:
+    if not is_nyse_trading_day(dt.date()):
         return False
+    close_h, close_m = get_nyse_close_hour_min(dt.date())
     open_dt = dt.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_dt = dt.replace(hour=16, minute=0, second=0, microsecond=0)
+    close_dt = dt.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
     return open_dt <= dt < close_dt
 
 
@@ -192,8 +297,8 @@ def _overlay_fresh_bar(
     return out
 
 
-def prefetch_histories(tickers: List[str], period: str = "6mo") -> Dict[str, pd.DataFrame]:
-    """Batch-downloads OHLCV histories via yfinance and overlays fresh 5d/1m bars to defeat 6mo CDN lag."""
+def prefetch_histories(tickers: List[str], period: str = "1y") -> Dict[str, pd.DataFrame]:
+    """Batch-downloads OHLCV histories via yfinance and overlays fresh 5d/1m bars to defeat CDN lag."""
     prefetched: Dict[str, pd.DataFrame] = {}
     if len(tickers) <= 1:
         return prefetched
@@ -220,11 +325,11 @@ def prefetch_histories(tickers: List[str], period: str = "6mo") -> Dict[str, pd.
     return prefetched
 
 
-def _expected_intraday_vol_fraction(minutes_passed: float) -> float:
+def _expected_intraday_vol_fraction(minutes_passed: float, session_minutes: float = 390.0) -> float:
     """US equity (NYSE/NASDAQ) pre-close cumulative volume curve (~8% open + ~80% continuous + ~12% closing auction)."""
-    if minutes_passed <= 0.0 or minutes_passed >= 390.0:
+    if minutes_passed <= 0.0 or minutes_passed >= session_minutes:
         return 1.0
-    return 0.08 + 0.80 * (max(minutes_passed, 5.0) / 390.0)
+    return 0.08 + 0.80 * (max(minutes_passed, 5.0) / session_minutes)
 
 
 def get_stock_data(
@@ -239,7 +344,7 @@ def get_stock_data(
         if prefetched_hist is not None and not prefetched_hist.empty and req_cols.issubset(prefetched_hist.columns):
             hist = prefetched_hist.copy()
         else:
-            hist = ticker.history(period="6mo", timeout=10)
+            hist = ticker.history(period="1y", timeout=10)
             if hist is not None and not hist.empty:
                 now_et = _now_et()
                 h5 = ticker.history(period="5d", timeout=8)
@@ -261,45 +366,74 @@ def get_stock_data(
         if mode == "SHORT":
             hist.ta.ema(length=5, append=True)
             hist.ta.ema(length=9, append=True)
+            hist.ta.ema(length=21, append=True)
             hist.ta.sma(length=50, append=True)
+            hist.ta.sma(length=200, append=True)
             hist.ta.rsi(length=7, append=True)
+            hist.ta.rsi(length=14, append=True)
             hist.ta.atr(length=5, append=True)
+            hist.ta.atr(length=14, append=True)
             hist.ta.bbands(length=20, std=2, append=True)
             hist.ta.adx(length=14, append=True)
 
             latest = hist.iloc[-1]
             prev = hist.iloc[-2] if len(hist) > 1 else latest
+            atr_14_series = hist["ATRr_14"] if "ATRr_14" in hist else None
+            # Use completed prior-session ATR_14 during regular hours so partial morning bars do not shrink ATR
+            if atr_14_series is not None:
+                atr_ref = atr_14_series.iloc[-2] if (_is_tsx_regular_hours(now_et) and len(atr_14_series) >= 2 and pd.notna(atr_14_series.iloc[-2])) else atr_14_series.iloc[-1]
+                atr_14_val = round(float(atr_ref), 2) if pd.notna(atr_ref) else "N/A"
+            else:
+                atr_14_val = "N/A"
 
             if len(hist) > 10:
                 vol_sma_10 = float(hist["Volume"].iloc[:-1].tail(10).mean())
             else:
                 vol_sma_10 = float(hist["Volume"].rolling(window=10).mean().iloc[-1])
 
+            close_h, close_m = get_nyse_close_hour_min(now_et.date())
+            session_mins = 210.0 if close_h == 13 else 390.0
             market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-            market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-            if now_et < market_open:
+            market_close = now_et.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+            if not is_nyse_trading_day(now_et.date()) or now_et < market_open:
                 minutes_passed = 0.0
             elif now_et > market_close:
-                minutes_passed = 390.0
+                minutes_passed = session_mins
             else:
                 minutes_passed = (now_et - market_open).total_seconds() / 60.0
 
-            adjusted_sma = vol_sma_10 * _expected_intraday_vol_fraction(minutes_passed)
+            adjusted_sma = vol_sma_10 * _expected_intraday_vol_fraction(minutes_passed, session_mins)
             vol_ratio = (float(latest["Volume"]) / adjusted_sma) if adjusted_sma > 0 else 1.0
 
             price = float(latest["Close"])
             ema_5 = float(latest["EMA_5"]) if "EMA_5" in latest and pd.notna(latest["EMA_5"]) else 0.0
             ema_9 = float(latest["EMA_9"]) if "EMA_9" in latest and pd.notna(latest["EMA_9"]) else 0.0
+            ema_21 = float(latest["EMA_21"]) if "EMA_21" in latest and pd.notna(latest["EMA_21"]) else 0.0
             prev_ema_5 = float(prev["EMA_5"]) if "EMA_5" in prev and pd.notna(prev["EMA_5"]) else ema_5
             dmp_14 = float(latest["DMP_14"]) if "DMP_14" in latest and pd.notna(latest["DMP_14"]) else 0.0
             dmn_14 = float(latest["DMN_14"]) if "DMN_14" in latest and pd.notna(latest["DMN_14"]) else 0.0
             sma_50 = float(latest["SMA_50"]) if "SMA_50" in latest and pd.notna(latest["SMA_50"]) else 0.0
+            sma_200 = float(latest["SMA_200"]) if "SMA_200" in latest and pd.notna(latest["SMA_200"]) else 0.0
+            sma_50_rising = (
+                bool(sma_50 >= float(hist["SMA_50"].iloc[-6]))
+                if ("SMA_50" in hist and len(hist) >= 6 and pd.notna(hist["SMA_50"].iloc[-6]))
+                else True
+            )
             if len(hist) >= 21 and float(hist["Close"].iloc[-21]) > 0:
                 ret_20d = round(((price - float(hist["Close"].iloc[-21])) / float(hist["Close"].iloc[-21])) * 100.0, 2)
             elif len(hist) >= 2 and float(hist["Close"].iloc[0]) > 0:
                 ret_20d = round(((price - float(hist["Close"].iloc[0])) / float(hist["Close"].iloc[0])) * 100.0, 2)
             else:
                 ret_20d = 0.0
+            if len(hist) >= 64 and float(hist["Close"].iloc[-64]) > 0:
+                ret_63d = round(((price - float(hist["Close"].iloc[-64])) / float(hist["Close"].iloc[-64])) * 100.0, 2)
+            else:
+                ret_63d = ret_20d
+            if len(hist) >= 127 and float(hist["Close"].iloc[-127]) > 0:
+                ret_126d = round(((price - float(hist["Close"].iloc[-127])) / float(hist["Close"].iloc[-127])) * 100.0, 2)
+            else:
+                ret_126d = ret_63d
+            rs_score = round(0.50 * ret_63d + 0.35 * ret_126d + 0.15 * ret_20d, 2)
 
             if ema_5 > ema_9 and ema_5 > 0:
                 sma50_ceiling = sma_50 > 0 and ema_9 < sma_50 and abs(price - sma_50) / sma_50 <= 0.015
@@ -339,10 +473,18 @@ def get_stock_data(
                 "EMA_Crossover": crossover,
                 "EMA_5": round(ema_5, 2) if ema_5 > 0 else "N/A",
                 "EMA_9": round(ema_9, 2) if ema_9 > 0 else "N/A",
+                "EMA_21": round(ema_21, 2) if ema_21 > 0 else "N/A",
                 "SMA_50": round(sma_50, 2) if sma_50 > 0 else "N/A",
+                "SMA_50_Rising": sma_50_rising,
+                "SMA_200": round(sma_200, 2) if sma_200 > 0 else "N/A",
                 "Ret_20d": ret_20d,
+                "Ret_63d": ret_63d,
+                "Ret_126d": ret_126d,
+                "RS_Score": rs_score,
                 "RSI_7": round(float(latest["RSI_7"]), 2) if "RSI_7" in latest and pd.notna(latest["RSI_7"]) else "N/A",
+                "RSI_14": round(float(latest["RSI_14"]), 2) if "RSI_14" in latest and pd.notna(latest["RSI_14"]) else "N/A",
                 "ATR_5": round(float(latest["ATRr_5"]), 2) if "ATRr_5" in latest and pd.notna(latest["ATRr_5"]) else "N/A",
+                "ATR_14": atr_14_val,
                 "ADX_14": round(float(latest["ADX_14"]), 2) if "ADX_14" in latest and pd.notna(latest["ADX_14"]) else "N/A",
                 "BB_Lower": round(float(latest[bb_lower_col]), 2) if bb_lower_col and pd.notna(latest[bb_lower_col]) else "N/A",
                 "BB_Mid": round(float(latest[bb_mid_col]), 2) if bb_mid_col and pd.notna(latest[bb_mid_col]) else "N/A",
@@ -385,7 +527,15 @@ def get_stock_data(
 
 def get_macro_alignment() -> Dict[str, Any]:
     """Checks intraday/daily directional alignment for Gold (GC=F), Crude Oil (CL=F), VIX regime (^VIX), and S&P 500 trend (SPY)."""
-    state: Dict[str, Any] = {"GC=F": True, "CL=F": True, "VIX_ELEVATED": False, "VIX_PANIC": False, "SPY_BELOW_SMA50": False}
+    state: Dict[str, Any] = {
+        "GC=F": True,
+        "CL=F": True,
+        "VIX_ELEVATED": False,
+        "VIX_STAGE2_BLOCK": False,
+        "VIX_PANIC": False,
+        "SPY_BELOW_SMA50": False,
+        "SPY_BELOW_SMA200": False,
+    }
     for sym in ("GC=F", "CL=F"):
         try:
             hist = yf.Ticker(sym).history(period="5d", timeout=8)
@@ -394,20 +544,23 @@ def get_macro_alignment() -> Dict[str, Any]:
         except Exception:
             pass
     try:
-        # ponytail: VIX >= 25 or +10% spike -> 0.5x tranche (VIX_ELEVATED); VIX >= 35 -> full freeze (VIX_PANIC)
         vh = yf.Ticker("^VIX").history(period="5d", timeout=8)
         if vh is not None and len(vh) >= 2:
             v_cur, v_prev = float(vh["Close"].iloc[-1]), float(vh["Close"].iloc[-2])
             state["VIX_ELEVATED"] = v_cur >= 25.0 or (v_prev > 0 and ((v_cur - v_prev) / v_prev) >= 0.10)
+            state["VIX_STAGE2_BLOCK"] = v_cur >= 32.0
             state["VIX_PANIC"] = v_cur >= 35.0
     except Exception:
         pass
     try:
-        sh = yf.Ticker("SPY").history(period="3mo", timeout=8)
+        sh = yf.Ticker("SPY").history(period="1y", timeout=8)
         if sh is not None and len(sh) >= 50:
-            spy_sma50 = float(sh["Close"].tail(50).mean())
             spy_cur = float(sh["Close"].iloc[-1])
+            spy_sma50 = float(sh["Close"].tail(50).mean())
             state["SPY_BELOW_SMA50"] = bool(spy_cur < spy_sma50)
+            if len(sh) >= 200:
+                spy_sma200 = float(sh["Close"].tail(200).mean())
+                state["SPY_BELOW_SMA200"] = bool(spy_cur < spy_sma200)
     except Exception:
         pass
     return state

@@ -8,13 +8,20 @@ Objective, quantitative, institutional reporting format.
 import os
 import html
 import json
+import time
 import requests
 import datetime
 from typing import Dict, Any, Optional, List
 
+try:
+    from maple_market import now_et_naive as _now_et
+except Exception:
+    _now_et = datetime.datetime.now
+
 MAPLE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(MAPLE_DIR, "telegram_config.json")
 ENV_FILE = os.path.join(MAPLE_DIR, ".env")
+_LAST_BREAKER_ALERTS: Dict[str, float] = {}
 
 
 def load_telegram_config() -> Dict[str, Any]:
@@ -78,8 +85,24 @@ def is_configured() -> bool:
     return True
 
 
+def _split_telegram_chunks(message: str, max_len: int = 4000) -> List[str]:
+    if len(message) <= max_len:
+        return [message]
+    chunks: List[str] = []
+    remaining = message
+    while len(remaining) > max_len:
+        cut = remaining.rfind("\n", 0, max_len)
+        if cut <= 0:
+            cut = max_len
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
-    """Sends a message to the configured Telegram chat with retry on connection resets."""
+    """Sends a message to the configured Telegram chat with 4096-char chunking and retry on connection resets."""
     cfg = load_telegram_config()
     token = cfg.get("telegram_bot_token", "").strip()
     chat_id = str(cfg.get("telegram_chat_id", "")).strip()
@@ -88,32 +111,56 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-
-    import time
-    for attempt in range(1, 4):
-        try:
-            res = requests.post(url, json=payload, timeout=10)
-            if res.status_code == 200:
-                return True
-            else:
+    all_ok = True
+    for chunk in _split_telegram_chunks(message):
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        sent = False
+        for attempt in range(1, 4):
+            try:
+                res = requests.post(url, json=payload, timeout=10)
+                if res.status_code == 200:
+                    sent = True
+                    break
                 print(f"[TELEGRAM ERROR] HTTP {res.status_code}: {res.text}")
-                return False
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            if attempt < 3:
-                time.sleep(1.0)
-                continue
-            print(f"[TELEGRAM ERROR] Request failed after {attempt} attempts: {e}")
-            return False
-        except Exception as e:
-            print(f"[TELEGRAM ERROR] Exception: {e}")
-            return False
-    return False
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < 3:
+                    time.sleep(1.0)
+                    continue
+                print(f"[TELEGRAM ERROR] Request failed after {attempt} attempts: {e}")
+                break
+            except Exception as e:
+                print(f"[TELEGRAM ERROR] Exception: {e}")
+                break
+        if not sent:
+            all_ok = False
+    return all_ok
+
+
+def send_circuit_breaker_alert(title: str, details: str, cooldown_minutes: int = 30) -> bool:
+    """Dispatches a rate-limited high-priority alert when a risk breaker or broker disconnect occurs."""
+    cfg = load_telegram_config()
+    if not cfg.get("notify_on_circuit_breakers", True) or not is_configured():
+        return False
+    now_ts = time.time()
+    last_ts = _LAST_BREAKER_ALERTS.get(title, 0.0)
+    if cooldown_minutes > 0 and (now_ts - last_ts) < (cooldown_minutes * 60.0):
+        return False
+    now_str = _now_et().strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"🚨 <b>MAPLE CIRCUIT BREAKER: {html.escape(str(title))}</b>\n"
+        f"• {html.escape(str(details))}\n\n"
+        f"<i>Time: {now_str} ET | Desk: MAPLE Autonomous Trading</i>"
+    )
+    ok = send_telegram_message(msg)
+    if ok:
+        _LAST_BREAKER_ALERTS[title] = now_ts
+    return ok
 
 
 def send_trade_alert(
@@ -133,7 +180,7 @@ def send_trade_alert(
     if not cfg.get("notify_on_trades", True) or not is_configured():
         return False
 
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = _now_et().strftime("%Y-%m-%d %H:%M:%S")
     action_upper = action.upper()
 
     lines = []
@@ -146,6 +193,8 @@ def send_trade_alert(
         if target_price:
             gain_pct = ((target_price - price) / price) * 100 if price > 0 else 0
             lines.append(f"• <b>Profit Target:</b> USD {target_price:.2f} (+{gain_pct:.1f}%)")
+        elif "STAGE2_RS" in str(notes).upper():
+            lines.append("• <b>Profit Target:</b> Uncapped (Stage-2 SMA50/EMA21 Trail)")
         if stop_loss_price:
             loss_pct = ((price - stop_loss_price) / price) * 100 if price > 0 else 0
             lines.append(f"• <b>Stop Loss:</b> USD {stop_loss_price:.2f} (-{loss_pct:.1f}%)")
@@ -193,7 +242,7 @@ def send_scan_update(
     if not cfg.get("notify_on_scans", True) or not is_configured():
         return False
 
-    now_str = datetime.datetime.now().strftime("%H:%M:%S")
+    now_str = _now_et().strftime("%H:%M:%S")
     from maple_ledger import get_total_invested_capital
     inv_cap = get_total_invested_capital()
     base_cap = inv_cap if inv_cap > 0 else 1000.0
@@ -202,7 +251,7 @@ def send_scan_update(
 
     lines = [
         f"<b>MAPLE Scan Update ({now_str} ET)</b>",
-        f"• <b>Desk Status:</b> {action_taken}",
+        f"• <b>Desk Status:</b> {html.escape(str(action_taken))}",
         f"• <b>Portfolio NAV:</b> USD {total_equity:.2f} ({cum_sign}{cum_return:.2f}% vs USD {base_cap:,.0f} invested)",
         f"• <b>Available Cash:</b> USD {cash:.2f}",
     ]
@@ -264,8 +313,9 @@ def send_retrospective_report(
     if not cfg.get("notify_on_close", True) or not is_configured():
         return False
 
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    is_friday = (str(session_type).upper() == "WEEKLY") or (datetime.datetime.now().weekday() == 4)
+    now_dt = _now_et()
+    now_str = now_dt.strftime("%Y-%m-%d")
+    is_friday = (str(session_type).upper() == "WEEKLY") or (now_dt.weekday() == 4)
     period_label = "Weekly Close Performance Report" if is_friday else "Daily Close Performance Report"
 
     # Cumulative Return vs total contributed capital
@@ -311,7 +361,7 @@ def send_retrospective_report(
         )
     if basket_pct is not None and prev_equity and prev_equity > 0:
         lines.append(
-            f"• <b>47-Ticker US Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
+            f"• <b>53-Ticker US Shariah Basket:</b> {basket_pct:+.2f}% (Relative Alpha: {daily_pct - basket_pct:+.2f}%)"
         )
     lines.extend([
         f"• <b>Cumulative P&L (Inception):</b> {cum_sign}USD {cum_pnl:.2f} ({cum_sign}{cum_pct:.2f}%{twr_tag})",
@@ -384,7 +434,7 @@ def send_retrospective_report(
             cur_px = rw["current_price"]
             dist_cad = rw["distance_to_stop_cad"]
             dist_pct = rw["distance_to_stop_pct"]
-            drawdown_note = rw.get("note", "")
+            drawdown_note = html.escape(str(rw.get("note", "")))
             lines.append(
                 f"• ⚠️ <code>{sym}</code>: Current USD {cur_px:.2f} vs Stop USD {stop_px:.2f} "
                 f"(Buffer: USD {dist_cad:.2f} / {dist_pct:.1f}% to stop). {drawdown_note}"
@@ -412,10 +462,10 @@ def send_retrospective_report(
     if changes_made:
         for chg in changes_made:
             prefix = "" if str(chg).startswith("[") else "[TUNED] "
-            lines.append(f"• {prefix}{chg}")
+            lines.append(f"• {html.escape(prefix + str(chg))}")
     else:
-        lines.append("• All sector caps (max 35%), stop buffers, and drawdown limits within operating boundaries.")
-    lines.append("• 47 AAOIFI-vetted US equities active in surveillance.")
+        lines.append("• All sector caps, stop buffers, and drawdown limits within operating boundaries.")
+    lines.append("• 53 AAOIFI-vetted US equities active in surveillance.")
 
     message = "\n".join(lines)
     return send_telegram_message(message)
