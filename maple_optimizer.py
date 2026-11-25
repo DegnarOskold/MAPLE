@@ -173,8 +173,10 @@ def get_weekly_summary(
     }
 
 
-def _classify_buy_bucket(notes: str) -> str:
+def _classify_buy_bucket(notes: str, ticker: str = "") -> str:
     notes_up = (notes or "").upper()
+    if (ticker and normalize_ticker(ticker) == SWEEP_ETF) or "IDLE-CASH SWEEP" in notes_up or "SWEEP UNWIND" in notes_up:
+        return "Idle-Cash Sweep"
     if "CAPITULATION" in notes_up:
         return "Capitulation Reversal"
     if "LOW-VOLUME" in notes_up or "SCALED" in notes_up:
@@ -199,7 +201,7 @@ def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
                 ticker = row.get("Ticker", "")
                 notes = row.get("Notes", "")
                 if action == "BUY" and ticker:
-                    last_buy_bucket[ticker] = _classify_buy_bucket(notes)
+                    last_buy_bucket[ticker] = _classify_buy_bucket(notes, ticker)
                 elif trade_date.startswith(today_str) and action == "SELL":
                     pnl_val = None
                     pnl_pct_val = None
@@ -209,6 +211,11 @@ def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
                         pnl_val = float(match.group(1))
                         pnl_pct_val = float(match.group(2))
 
+                    entry_bucket = (
+                        "Idle-Cash Sweep"
+                        if (ticker and normalize_ticker(ticker) == SWEEP_ETF)
+                        else last_buy_bucket.get(ticker, "Unknown")
+                    )
                     realized.append({
                         "ticker": ticker,
                         "action": action,
@@ -216,7 +223,7 @@ def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
                         "price": float(row.get("Price", 0)),
                         "pnl": pnl_val,
                         "pnl_pct": pnl_pct_val,
-                        "entry_bucket": last_buy_bucket.get(ticker, "Unknown"),
+                        "entry_bucket": entry_bucket,
                         "notes": notes,
                     })
     except Exception as e:
@@ -226,7 +233,7 @@ def get_daily_realized_trades(today_str: str) -> List[Dict[str, Any]]:
 
 
 def get_daily_buy_trades(today_str: str) -> List[Dict[str, Any]]:
-    """Extracts BUY fills executed today with 3-bucket signal classification."""
+    """Extracts BUY fills executed today with signal bucket classification."""
     buys = []
     if not os.path.exists(TRADES_FILE):
         return buys
@@ -234,12 +241,13 @@ def get_daily_buy_trades(today_str: str) -> List[Dict[str, Any]]:
         with open(TRADES_FILE, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 if row.get("Date", "").startswith(today_str) and row.get("Action", "").upper() == "BUY":
+                    ticker = row.get("Ticker", "")
                     buys.append({
-                        "ticker": row.get("Ticker", ""),
+                        "ticker": ticker,
                         "action": "BUY",
                         "quantity": float(row.get("Quantity", 0)),
                         "price": float(row.get("Price", 0)),
-                        "bucket": _classify_buy_bucket(row.get("Notes", "")),
+                        "bucket": _classify_buy_bucket(row.get("Notes", ""), ticker),
                     })
     except Exception as e:
         print(f"[OPTIMIZER WARNING] Failed to read BUY trades: {e}")
@@ -514,10 +522,11 @@ def run_daily_self_assessment():
         sec = pa.get("sector", "Other")
         sector_totals[sec] = sector_totals.get(sec, 0.0) + float(pa.get("market_value", 0.0))
 
-    # Count today's BUY entries by 3-way signal bucket
+    # Count today's BUY entries by signal bucket (separating Idle-Cash Sweep)
     reg_buys = sum(1 for b in buy_trades if b["bucket"] == "Regular Trend")
     scaled_buys = sum(1 for b in buy_trades if b["bucket"] == "Low-Volume Scaled")
     cap_buys = sum(1 for b in buy_trades if b["bucket"] == "Capitulation Reversal")
+    sweep_buys = sum(1 for b in buy_trades if b["bucket"] == "Idle-Cash Sweep")
 
     # 4. Missed Opportunities
     missed = scan_missed_opportunities(norm_allowed, prefetched=prefetched, macro_state=get_macro_alignment())
@@ -562,8 +571,9 @@ def run_daily_self_assessment():
             f"[DRAWDOWN AUDIT] Daily NAV delta {daily_pct:+.2f}% (USD {daily_pnl:+.2f}){worst_str}."
         )
     if buy_trades:
+        sweep_suffix = f", {sweep_buys} Idle-Cash Sweep" if sweep_buys > 0 else ""
         audit_flags.append(
-            f"[SIGNAL ATTRIBUTION] Today's BUY fills ({len(buy_trades)}): {reg_buys} Regular Trend, {scaled_buys} Low-Volume Scaled, {cap_buys} Capitulation Reversal."
+            f"[SIGNAL ATTRIBUTION] Today's BUY fills ({len(buy_trades)}): {reg_buys} Regular Trend, {scaled_buys} Low-Volume Scaled, {cap_buys} Capitulation Reversal{sweep_suffix}."
         )
     realized_with_pnl = [rt for rt in realized_trades if rt.get("pnl") is not None]
     if realized_with_pnl:
@@ -666,9 +676,14 @@ def run_daily_self_assessment():
                 if pa.get("entry_fee_cad", 0) > 0
                 else ""
             )
+            stop_note = (
+                "N/A (Sweep ETF)"
+                if normalize_ticker(pa["ticker"]) == SWEEP_ETF
+                else f"USD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
+            )
             report.append(
                 f"- **{pa['ticker']}** ({pa['sector']}, {pa['weight_pct']}% port, {pa['days_held']}d held): {pa['shares']:g} shs @ USD {pa['current_price']:.2f} (ACB: USD {pa['acb']:.2f}) "
-                f"| Unrealized: **USD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)**{fee_note} | Buffer to Stop: USD {pa['distance_to_stop_cad']:.2f} ({pa['distance_to_stop_pct']:.1f}%)"
+                f"| Unrealized: **USD {pa['unrealized_pnl']:+.2f} ({pa['unrealized_pct']:+.2f}%)**{fee_note} | Buffer to Stop: {stop_note}"
             )
 
     if risk_watchlist:

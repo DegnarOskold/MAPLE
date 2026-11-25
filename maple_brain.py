@@ -603,16 +603,18 @@ def run_intraday_scan(bot_advice: str = ""):
     # Output current portfolio equity using real-time price_map marks when available
     updated_state = get_ledger_state()
 
-    # Idle-Cash Sweep: park excess cash (> 10% NAV buffer) into SPUS during regular post-chop trading hours
+    # Idle-Cash Sweep: park excess cash (> 20% NAV buffer) into SPUS near market close (15:30-15:50 ET)
+    now_sweep = datetime.datetime.now()
+    in_sweep_window = (now_sweep.hour == 15 and 30 <= now_sweep.minute <= 50)
     if (
         config.get("idle_cash_sweep", False)
         and (market_active or not is_live)
         and not (is_opening_chop() and is_live)
-        and (not is_live or ledger_state.get("live_verified", False))
+        and (not is_live or (ledger_state.get("live_verified", False) and in_sweep_window))
     ):
         sw_cash = float(updated_state.get("cash", 0.0))
         sw_nav = float(updated_state.get("total_equity") or sw_cash)
-        excess_cash = round(sw_cash - (sw_nav * 0.10) - (20.0 if is_live else 0.0), 2)
+        excess_cash = round(sw_cash - (sw_nav * 0.20) - (20.0 if is_live else 0.0), 2)
         if excess_cash >= max(250.0, sw_nav * 0.05):
             sp_px = price_map.get(SWEEP_ETF)
             if not sp_px:
@@ -621,8 +623,8 @@ def run_intraday_scan(bot_advice: str = ""):
                     sp_px = float(sp_sd["Price"])
                     price_map[SWEEP_ETF] = sp_px
             if sp_px and excess_cash >= sp_px:
-                print(f"[MAPLE IDLE-CASH SWEEP] Deploying ${excess_cash:.2f} excess cash (>10% NAV buffer) into {SWEEP_ETF} @ ~${sp_px:.2f}...")
-                if execute_buy(SWEEP_ETF, excess_cash, sp_px, notes="[IDLE-CASH SWEEP] Excess cash > 10% NAV buffer"):
+                print(f"[MAPLE IDLE-CASH SWEEP] Deploying ${excess_cash:.2f} excess cash (>20% NAV buffer) into {SWEEP_ETF} @ ~${sp_px:.2f}...")
+                if execute_buy(SWEEP_ETF, excess_cash, sp_px, notes="[IDLE-CASH SWEEP] Excess cash > 20% NAV buffer"):
                     updated_state = get_ledger_state()
     refreshed_marks = False
     for t, p in updated_state.get("positions", {}).items():
