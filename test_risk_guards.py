@@ -1085,7 +1085,36 @@ def run_checks():
         maple_ledger.check_target_stops({"AVGO": 235.0}, market_data={"AVGO": {"EMA_21": 238.0, "SMA_50": 215.0, "ATR_14": 5.0}}, is_eod_window=True, top_keep_tickers={"AVGO"})
         assert len(s2_sells) == 1 and "AUTO STAGE-2 EMA_21 EXIT" in s2_sells[0][2], f"Variant D EOD profit harvest failed: {s2_sells}"
 
-    print("ALL 32 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
+    # 33. Optimizer STAGE2_RS parity: Top-N RS rank + SPY<SMA50&200 macro filter + RSI_14 + no 4d stagnation flag on STAGE2_RS holdings
+    opt_sd = {
+        "AAPL": {"Price": 210.0, "Prev_Close": 205.0, "Open": 206.0, "Pct_From_Low": 3.0, "EMA_21": 202.0, "SMA_50": 195.0, "SMA_50_Rising": True, "SMA_200": 180.0, "RSI_14": 61.5, "RSI_7": 68.2, "Vol_Ratio": 1.2, "RS_Score": 15.0},
+        "CSX": {"Price": 36.0, "Prev_Close": 35.0, "Open": 35.2, "Pct_From_Low": 3.2, "EMA_21": 35.0, "SMA_50": 34.0, "SMA_50_Rising": True, "SMA_200": 32.0, "RSI_14": 55.4, "RSI_7": 59.1, "Vol_Ratio": 1.3, "RS_Score": 3.8},
+    }
+    with patch.object(maple_optimizer, "get_ledger_state", return_value={"positions": {}}), \
+         patch.object(maple_optimizer, "load_config", return_value={"strategy_mode": "STAGE2_RS", "rs_top_n": 1, "active_targets": {}}):
+        missed_s2 = maple_optimizer.scan_missed_opportunities(
+            ["AAPL", "CSX"],
+            macro_state={"GC=F": True, "CL=F": True, "SPY_BELOW_SMA50": True, "SPY_BELOW_SMA200": True},
+            stock_data_map=opt_sd,
+        )
+    by_tk = {m["ticker"]: m for m in missed_s2}
+    assert by_tk["AAPL"]["eligible"] is False and "SPY below both 50-SMA and 200-SMA" in by_tk["AAPL"]["gate_status"] and by_tk["AAPL"]["rsi"] == 61.5
+    assert by_tk["CSX"]["eligible"] is False and "RS Rank Filter: Rank #2 outside Top 1" in by_tk["CSX"]["gate_status"]
+
+    with patch.object(maple_optimizer, "get_position_holding_days", return_value={"AVGO": 6, "KO": 6}), \
+         patch.object(maple_optimizer, "get_position_last_buy_info", return_value={}), \
+         patch.object(maple_optimizer, "load_config", return_value={"active_targets": {"AVGO": {"strategy_mode": "STAGE2_RS", "stop_loss_price": 190.0}, "KO": {"stop_loss_price": 93.5}}}):
+        _, wl_s2 = maple_optimizer.calculate_position_attribution(
+            {
+                "AVGO": {"shares": 5.0, "acb": 200.0, "current_price": 198.0, "stop_loss_price": 190.0},
+                "KO": {"shares": 10.0, "acb": 98.0, "current_price": 97.2, "stop_loss_price": 93.5},
+            },
+            5000.0,
+        )
+    wl_map = {w["ticker"]: w["note"] for w in wl_s2}
+    assert "AVGO" not in wl_map and "Stagnant loser" in wl_map.get("KO", ""), f"STAGE2_RS stagnation watchlist scoping failed: {wl_map}"
+
+    print("ALL 33 RISK GUARD, POST-MORTEM & STANDALONE ISOLATION CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

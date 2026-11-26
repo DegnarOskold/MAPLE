@@ -27,7 +27,16 @@ CHANGELOG_FILE = os.path.join(MAPLE_DIR, "maple_logic_changelog.md")
 NAV_FILE = os.path.join(MAPLE_DIR, "maple_daily_nav.json")
 TRADES_FILE = os.path.join(MAPLE_DIR, "maple_trades.csv")
 
-from maple_market import get_stock_data, get_corporate_calendar, prefetch_histories, get_macro_alignment, is_macro_aligned, now_et_naive
+from maple_market import (
+    get_stock_data,
+    get_corporate_calendar,
+    prefetch_histories,
+    get_macro_alignment,
+    is_macro_aligned,
+    now_et_naive,
+    GOLD_LINKED_TICKERS,
+    OIL_LINKED_TICKERS,
+)
 from maple_ledger import (
     load_config,
     save_config,
@@ -40,8 +49,10 @@ from maple_ledger import (
     get_position_holding_days,
     get_position_last_buy_info,
     normalize_ticker,
+    ticker_aliases,
     SWEEP_ETF,
 )
+from maple_brain import rank_universe_by_rs
 from maple_strategy import MapleStrategy
 
 
@@ -274,6 +285,7 @@ def calculate_position_attribution(
     held_set = {sym for sym, p in positions.items() if float(p.get("shares", 0)) > 0}
     holding_days = get_position_holding_days(active_tickers=held_set)
     buy_info_map = get_position_last_buy_info(active_tickers=held_set)
+    active_targets = load_config().get("active_targets", {})
 
     for sym, p in positions.items():
         shs = float(p.get("shares", 0))
@@ -326,13 +338,15 @@ def calculate_position_attribution(
         # 4. Held >= STAGNATION_DAYS with negative P&L
         notes = []
         if normalize_ticker(sym) != SWEEP_ETF:
+            t_info = next((active_targets[a] for a in ticker_aliases(sym) if a in active_targets), None) or p
+            is_stage2_pos = str(t_info.get("strategy_mode", "")).upper() == "STAGE2_RS"
             if unrealized_pct <= -1.5:
                 notes.append(f"Position drawdown: {unrealized_pct:.1f}%")
             if dist_to_stop_pct <= 3.0:
                 notes.append(f"Near stop-loss: {dist_to_stop_pct:.1f}% buffer")
             if weight_pct >= 25.0 and unrealized < 0:
                 notes.append(f"High portfolio concentration: {weight_pct:.1f}% of NAV")
-            if days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
+            if not is_stage2_pos and days_held >= MapleStrategy.STAGNATION_DAYS and unrealized < 0:
                 sd = (stock_data_map or {}).get(normalize_ticker(sym), {})
                 ema_5 = sd.get("EMA_5")
                 ema_9 = sd.get("EMA_9")
@@ -346,7 +360,7 @@ def calculate_position_attribution(
                     )
                 else:
                     notes.append(f"Stagnant loser: held {days_held}d (>= {MapleStrategy.STAGNATION_DAYS}d)")
-            elif days_held == MapleStrategy.STAGNATION_DAYS - 1 and unrealized < 0:
+            elif not is_stage2_pos and days_held == MapleStrategy.STAGNATION_DAYS - 1 and unrealized < 0:
                 notes.append(f"Approaching Day-{MapleStrategy.STAGNATION_DAYS} stagnation check tomorrow ({days_held}d held)")
 
         cal_info = (calendar_map or {}).get(normalize_ticker(sym), {})
@@ -371,23 +385,44 @@ def scan_missed_opportunities(
     allowed_tickers: List[str],
     prefetched: Optional[Dict[str, Any]] = None,
     macro_state: Optional[Dict[str, Any]] = None,
+    stock_data_map: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Identifies stocks that gained > 2.0% today or from low of day that MAPLE did not hold,
     filtering out overextended, non-trending, or structurally rejected setups.
     """
     missed = []
     state = get_ledger_state()
-    current_held = set(t for t, p in state["positions"].items() if p.get("shares", 0) > 0)
+    cfg = load_config()
+    is_stage2_cfg = str(cfg.get("strategy_mode", "")).upper() == "STAGE2_RS"
+    MapleStrategy._sync_from_config()
+    current_held = {normalize_ticker(t) for t, p in state["positions"].items() if p.get("shares", 0) > 0}
 
+    universe_sd: Dict[str, Dict[str, Any]] = dict(stock_data_map or {})
     for ticker in allowed_tickers:
-        if ticker in current_held:
+        norm_t = normalize_ticker(ticker)
+        if norm_t in universe_sd and ticker in universe_sd:
             continue
         try:
-            data = (
+            sd = (
                 get_stock_data(ticker, mode="SHORT", prefetched_hist=prefetched[ticker])
                 if (prefetched and ticker in prefetched)
                 else get_stock_data(ticker, mode="SHORT")
             )
+            if sd and sd.get("Price") not in ("N/A", None):
+                universe_sd[ticker] = sd
+                universe_sd.setdefault(norm_t, sd)
+        except Exception:
+            pass
+
+    ranked_rs = rank_universe_by_rs(universe_sd, set(allowed_tickers)) if is_stage2_cfg else []
+    rs_rank_map = {t: idx + 1 for idx, t in enumerate(ranked_rs)}
+
+    for ticker in allowed_tickers:
+        norm_t = normalize_ticker(ticker)
+        if ticker in current_held or norm_t in current_held:
+            continue
+        try:
+            data = universe_sd.get(ticker) or universe_sd.get(norm_t)
             if not data or data.get("Price") in ("N/A", None):
                 continue
 
@@ -398,12 +433,7 @@ def scan_missed_opportunities(
             day_gain = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
 
             if day_gain >= 2.0 or (day_gain > 0 and pct_from_low >= 2.5):
-                MapleStrategy._sync_from_config()
-                use_stage2 = (
-                    "RS_Score" in data
-                    and "SMA_200" in data
-                    and str(load_config().get("strategy_mode", "")).upper() == "STAGE2_RS"
-                )
+                use_stage2 = "RS_Score" in data and "SMA_200" in data and is_stage2_cfg
                 if use_stage2:
                     tranche_pct, gate_reason = MapleStrategy.evaluate_stage2_entry(data)
                 else:
@@ -424,12 +454,29 @@ def scan_missed_opportunities(
                 eligible = tranche_pct > 0.0
                 if eligible:
                     gate_status = f"ELIGIBLE ({tranche_pct*100:.0f}%)"
-                    if macro_state:
-                        aligned, macro_reason = is_macro_aligned(ticker, macro_state)
+                    rs_top_n = int(cfg.get("rs_top_n", MapleStrategy.RS_TOP_N))
+                    rs_rank = rs_rank_map.get(norm_t, 999)
+                    if use_stage2 and rs_rank > rs_top_n:
+                        eligible = False
+                        rs_val = data.get("RS_Score", 0.0)
+                        rs_str = f"{float(rs_val):+.2f}%" if isinstance(rs_val, (int, float)) else str(rs_val)
+                        gate_status = f"RS Rank Filter: Rank #{rs_rank} outside Top {rs_top_n} (RS {rs_str})"
+                    elif macro_state:
+                        aligned, macro_reason = is_macro_aligned(norm_t, macro_state)
                         if not aligned:
                             eligible = False
                             gate_status = f"Macro Filter: {macro_reason}"
-                        elif macro_state.get("SPY_BELOW_SMA50", False) and (
+                        elif use_stage2 and norm_t not in GOLD_LINKED_TICKERS and norm_t not in OIL_LINKED_TICKERS:
+                            if macro_state.get("VIX_STAGE2_BLOCK", False) or macro_state.get("VIX_PANIC", False):
+                                eligible = False
+                                gate_status = "Macro Filter: VIX >= 32 stress regime"
+                            elif macro_state.get("SPY_BELOW_SMA50", False) and macro_state.get("SPY_BELOW_SMA200", False):
+                                eligible = False
+                                gate_status = "Macro Filter: SPY below both 50-SMA and 200-SMA"
+                            elif macro_state.get("VIX_ELEVATED", False) and macro_state.get("SPY_BELOW_SMA50", False):
+                                tranche_pct = round(tranche_pct * 0.60, 4)
+                                gate_status = f"ELIGIBLE ({tranche_pct*100:.0f}%)"
+                        elif not use_stage2 and macro_state.get("SPY_BELOW_SMA50", False) and (
                             "Capitulation" in gate_reason or "Single-Bypass Rule" in gate_reason
                         ):
                             eligible = False
@@ -440,7 +487,7 @@ def scan_missed_opportunities(
                     "ticker": ticker,
                     "day_gain": round(day_gain, 2),
                     "pct_from_low": round(pct_from_low, 2),
-                    "rsi": data.get("RSI_7", "N/A"),
+                    "rsi": data.get("RSI_14", data.get("RSI_7", "N/A")) if use_stage2 else data.get("RSI_7", "N/A"),
                     "vol_ratio": data.get("Vol_Ratio", "N/A"),
                     "adx": data.get("ADX_14", "N/A"),
                     "ema_crossover": data.get("EMA_Crossover", "N/A"),
@@ -554,7 +601,9 @@ def run_daily_self_assessment():
     sweep_buys = sum(1 for b in buy_trades if b["bucket"] == "Idle-Cash Sweep")
 
     # 4. Missed Opportunities
-    missed = scan_missed_opportunities(norm_allowed, prefetched=prefetched, macro_state=get_macro_alignment())
+    missed = scan_missed_opportunities(
+        norm_allowed, prefetched=prefetched, macro_state=get_macro_alignment(), stock_data_map=stock_data_map
+    )
     changes_made = []
     audit_flags = []
     if abs(day_flows) >= 1.0:
